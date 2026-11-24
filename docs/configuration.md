@@ -173,8 +173,9 @@ pending cards. It only gets read-only tools plus `WebSearch` and `WebFetch`.
 * A setup failure when a builder starts is only noted on the task; before the
   checks, it counts as a failed check.
 * Without checks, only the agent review and the merge rules gate a merge
-  (`autopilot doctor` warns). When you have checks, the reviewer is also
-  allowed to run the check commands itself.
+  (`autopilot doctor` warns). When you have checks, the reviewer may also run
+  a check command itself, exactly as configured and with no added arguments,
+  if each of its words is plain (letters, digits and `_@%+=:,./-`).
 
 ### `integration`
 

@@ -289,7 +289,7 @@ ${bullet(notes)}
 }
 
 export function reviewerSystemPrompt(cfg: ProjectConfig): string {
-  return `You are the independent reviewer in StayOn Autopilot for the project "${cfg.name}". You did not write the change under review and you must not modify, commit or push anything: read files, inspect the diff, and run read-only commands or the project's tests only.
+  return `You are the independent reviewer in StayOn Autopilot for the project "${cfg.name}". You did not write the change under review and you must not modify, commit or push anything: read files, inspect the diff, and run only read-only commands and the commands your review prompt lists, exactly as written.
 
 Judge the exact revision you are given:
 - Does it meet each acceptance criterion, with evidence you checked yourself (not only the builder's claims)?
@@ -302,9 +302,35 @@ ${SHARED_RULES}
 Verdict: "approve" when there are no blocker/major problems; "request_changes" for concrete, fixable problems (each finding must say what to change); "needs_human" only when a founder judgement is genuinely required (product taste, sensitive trade-off) — then put the exact question in humanQuestion. Risk: low/medium/high from blast radius, reversibility and sensitivity. Finish with the required JSON result.`;
 }
 
-export function reviewerPrompt(task: Task, diff: DiffSummary, checks: CheckRecord[], builderSummary: string): string {
+/**
+ * The git commands a reviewer may run for the revision under review, exactly as its prompt lists
+ * them. The supervisor allows each one as an exact rule: prefix rules such as Bash(git diff:*)
+ * would also allow git's --output=<file>, which writes any file.
+ */
+export function reviewerGitCommands(baseCommit: string, headCommit: string): string[] {
+  return [`git diff ${baseCommit} ${headCommit}`, `git diff --stat ${baseCommit} ${headCommit}`, `git log --oneline ${baseCommit}..${headCommit}`];
+}
+
+/**
+ * The configured check commands a reviewer may run, exactly as its prompt lists them; the
+ * supervisor allows each one as an exact rule. A prefix rule such as Bash(npm test:*) would let
+ * the reviewer add options that write files (git diff --check --output=<file>, eslint -o <file>).
+ * Only commands made of plain words (ASCII letters, digits and _@%+=:,./-) qualify: a shell runs
+ * them as configured (except that leading NAME=value words are variable assignments, and zsh
+ * expands a word that starts with "=" to a command's path), and a permission rule reads them
+ * literally (a * there matches anything).
+ */
+export function reviewerCheckCommands(checks: readonly { run: readonly string[] }[]): string[] {
+  const plain = checks.filter((c) => c.run.length > 0 && c.run.every((word) => /^[\w@%+=:,./-]+$/.test(word)));
+  return [...new Set(plain.map((c) => c.run.join(' ')))];
+}
+
+export function reviewerPrompt(task: Task, diff: DiffSummary, checks: CheckRecord[], builderSummary: string, checkCommands: string[]): string {
   const files = diff.files.map((f) => `- ${f.status} ${f.path} (+${f.added} -${f.deleted})`).join('\n');
   const checkLines = checks.length ? checks.map((c) => `- ${c.name}: ${c.status}`).join('\n') : '- (no automated checks configured)';
+  const checkRuns = checkCommands.length
+    ? `Run the project's checks only with these commands:\n${bullet(checkCommands)}`
+    : "The project's checks cannot be run in this review; their results are below.";
   return `# Review ${task.id}: ${task.title}
 
 Objective:
@@ -316,7 +342,10 @@ ${bullet(task.acceptanceCriteria)}
 Owned paths: ${task.ownedPaths.join(', ') || '(not specified)'} · Risk declared by planner: ${task.risk}
 Base commit: ${diff.baseCommit}
 Head commit under review: ${diff.headCommit}
-Reproduce the diff yourself with: git diff ${diff.baseCommit} ${diff.headCommit}
+Inspect the change with these git commands:
+${bullet(reviewerGitCommands(diff.baseCommit, diff.headCommit))}
+${checkRuns}
+Use these commands exactly as written: other git diff, log or show commands, or these commands with anything added, are not allowed.
 
 Changed files:
 ${files || '(none)'}

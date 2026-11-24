@@ -174,9 +174,14 @@ Within that model:
   database, token, configs and run logs.
 * Builders are denied the tools to push or merge (`git push`, `gh pr merge`,
   `gh pr review`), and only the supervisor integrates. Reviewers and the planner
-  run with `dontAsk` permission mode and no edit tools: read tools and read-only
-  git commands, plus your configured check commands for the reviewer and
-  WebSearch/WebFetch for the planner.
+  run with `dontAsk` permission mode and no edit tools: read tools, `git status`,
+  `git ls-files` and `ls`, plus WebSearch/WebFetch for the planner. A reviewer
+  may also run, exactly as its prompt lists them, the `git diff`/`git log`
+  commands for the revision under review and those of your check commands whose
+  arguments are all plain words (letters, digits and `_@%+=:,./-`). Beyond
+  `git status`, `git ls-files` and `ls`, neither role gets a prefix rule:
+  `git diff:*` or `npm test:*` would let it add options that write files
+  (`--output=<file>`, `eslint -o`).
 * Workers run with API-key variables removed, so they always use the Claude
   subscription; there is no silent paid-API fallback.
 * The agent bridge (`/agent/tools/*`) accepts only loopback connections with a
@@ -213,4 +218,4 @@ runner against temporary repositories:
 | GitHub feedback (`github-feedback.test.ts`) | Trusted change request repairs once even if redelivered; untrusted comments ignored; a trusted GitHub approval of the exact head merges and supersedes the card; feedback after merge becomes a follow-up task; `/approve` needs the card's one-time code. |
 | Target branch tampering | A builder that moves `main` is caught; `main` restored; project paused with an urgent card; the work later merges only through the gate. |
 | Quota governor | After a usage warning, later builders start only when no other builder runs. |
-| Regressions (`regressions.test.ts`) | Policy edits need approval and update the runtime in place; a rejected revision never merges; cancelling one task keeps a shared card for the others; no cancel during a merge; secrets never published or merged; a replace ref cannot hide a change from the merge gate; an answer arriving before the run ends resumes without a second card; a builder that switches branches keeps its work; after merging `main` into its branch, a task is judged only on its own changes. |
+| Regressions (`regressions.test.ts`) | Policy edits need approval and update the runtime in place; a rejected revision never merges; cancelling one task keeps a shared card for the others; no cancel during a merge; secrets never published or merged; a replace ref cannot hide a change from the merge gate; reviewers and the planner get no git command that can write files; an answer arriving before the run ends resumes without a second card; a builder that switches branches keeps its work; after merging `main` into its branch, a task is judged only on its own changes. |

@@ -25,6 +25,8 @@ import {
   plannerPrompt,
   plannerSystemPrompt,
   prBody,
+  reviewerCheckCommands,
+  reviewerGitCommands,
   reviewerPrompt,
   reviewerSystemPrompt,
 } from './prompts.ts';
@@ -118,7 +120,13 @@ function builderTools(mode: RunSpec['permissionMode']): string[] {
   if (mode === 'acceptEdits') return [...read, 'Bash', 'WebSearch', 'WebFetch'];
   return [...read, 'Bash', 'Edit', 'Write', 'NotebookEdit', 'WebSearch', 'WebFetch'];
 }
-const READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git status:*)', 'Bash(git ls-files:*)', 'Bash(ls:*)'];
+/**
+ * Reviewers and planners. Their only prefix rules are for commands without an option that writes
+ * files: git diff, log and show have --output=<file>, and check commands have their own (eslint -o,
+ * --fix). A reviewer gets exact rules for the commands its prompt names (reviewerGitCommands,
+ * reviewerCheckCommands).
+ */
+const READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git status:*)', 'Bash(git ls-files:*)', 'Bash(ls:*)'];
 const WRITE_TOOLS = ['Edit', 'Write', 'NotebookEdit'];
 /**
  * Builders never need GitHub or ref-rewriting git commands; the supervisor does all
@@ -1422,18 +1430,21 @@ export class Supervisor implements SupervisorActions {
     const checks = this.store.latestChecks(t.id, t.headCommit!, 'branch');
     const lastBuild = this.store.listRuns({ taskId: t.id, limit: 10 }).find((r) => r.role === 'builder' && r.result);
     const builderSummary = (lastBuild?.result as BuilderResult | null)?.summary ?? '';
-    const checkTools = cfg.checks.commands.map((c) => `Bash(${c.run.join(' ')}:*)`);
+    // Exact rules (no ":*"), so nothing can be appended to these commands.
+    const checkCommands = reviewerCheckCommands(cfg.checks.commands);
+    const checkTools = checkCommands.map((c) => `Bash(${c})`);
+    const gitTools = reviewerGitCommands(diff.baseCommit, diff.headCommit).map((c) => `Bash(${c})`);
     this.startRun(rt, {
       runId,
       role: 'reviewer',
       task: t,
       generation,
       cwd: t.worktree!,
-      prompt: reviewerPrompt(t, diff, checks, builderSummary),
+      prompt: reviewerPrompt(t, diff, checks, builderSummary, checkCommands),
       system: reviewerSystemPrompt(cfg),
       resumeSessionId: null,
       permissionMode: 'dontAsk',
-      allowedTools: [...READ_ONLY_TOOLS, ...checkTools, ...MCP(['get_task_context', 'report_progress', 'propose_task'])],
+      allowedTools: [...READ_ONLY_TOOLS, ...gitTools, ...checkTools, ...MCP(['get_task_context', 'report_progress', 'propose_task'])],
       disallowedTools: [...WRITE_TOOLS, ...DEFAULT_DISALLOWED_TOOLS, ...BUILDER_DENY, ...CREDENTIAL_DENY, ...stateDeny(this.opts.home.root), ...cfg.execution.disallowedTools],
       jsonSchema: REVIEWER_RESULT_SCHEMA,
       model: cfg.execution.reviewerModel ?? cfg.execution.model,

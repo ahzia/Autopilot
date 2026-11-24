@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { approve, builderResult, commitFile, harness, type Harness } from './harness.ts';
 import type { ProjectConfig } from '../../src/config.ts';
+import type { RunSpec } from '../../src/types.ts';
 
 const T = { timeout: 60_000 };
 
@@ -169,6 +170,40 @@ test('a replace ref cannot hide a change from the merge gate', T, async () => {
     assert.ok(h.store.listEvents({ types: ['merge.classified'] }).some((e) => e.message.includes('reject')), 'the hidden policy edit was seen');
     assert.equal(h.readTarget('.autopilot/policy.json'), null);
     assert.equal(h.readTarget('feature.txt'), 'f\n');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('reviewers and planners get no git command that can write files (git diff/log/show --output)', T, async () => {
+  const specs: RunSpec[] = [];
+  const h = await harness({
+    config: (c) => {
+      c.planner.enabled = true;
+      c.planner.cooldownMinutes = 60;
+    },
+    behavior: (spec) => async (ctl) => {
+      specs.push(spec);
+      if (spec.role === 'planner') return { status: 'succeeded', structuredOutput: { summary: 'nothing new', newTasks: [], acceptTaskIds: [], cancelTaskIds: [], questions: [] } };
+      if (spec.role === 'reviewer') return { status: 'succeeded', structuredOutput: approve };
+      await commitFile(ctl, 'r.txt', 'r\n', 'r');
+      return { status: 'succeeded', structuredOutput: builderResult('completed') };
+    },
+  });
+  try {
+    const t = h.addTask('Reviewed');
+    await h.sup.start();
+    await h.waitState(t.id, 'integrated');
+    await h.waitFor(() => specs.some((s) => s.role === 'planner'), 'a planner run');
+    const gitRules = (s: RunSpec) => s.allowedTools.filter((r) => /^Bash\(git (diff|log|show)\b/.test(r));
+    assert.deepEqual(gitRules(specs.find((s) => s.role === 'planner')!), [], 'the planner reads files with Read/Glob/Grep');
+
+    // The reviewer: exact rules (nothing can be appended) for the commands its prompt names.
+    const reviewer = specs.find((s) => s.role === 'reviewer')!;
+    const { baseCommit: base, headCommit: head } = h.store.getTask(t.id)!;
+    const commands = [`git diff ${base} ${head}`, `git diff --stat ${base} ${head}`, `git log --oneline ${base}..${head}`];
+    assert.deepEqual(gitRules(reviewer), commands.map((c) => `Bash(${c})`));
+    for (const c of commands) assert.ok(reviewer.prompt.includes(`- ${c}\n`), `the prompt names: ${c}`);
   } finally {
     await h.cleanup();
   }
