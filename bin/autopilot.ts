@@ -24,7 +24,8 @@ Setup
   init <id> --source <repo> [--create] [--name N] [--docs a.md,b.md] [--forge local|github --github owner/name]
        [--target main] [--profile balanced_autopilot] [--check "name=cmd args"]... [--setup "npm ci"]...
        [--charter "..."] [--runner claude-cli|fake]
-                          Create a project config in the autopilot home (--create makes a new repo)
+                          Create a project config in the autopilot home (--create makes a new repo
+                          in a new or empty folder)
   doctor                  Check Claude login, git, gh, configs and the inbox server
   pair                    Print a one-time link that signs your phone into the inbox
 
@@ -107,6 +108,18 @@ export function parseCheckFlag(c: string): { name: string; run: string[]; timeou
   return { name: m ? m[1] : cmd[0], run: cmd, timeoutSeconds: 900 };
 }
 
+/** True when nothing exists at `path` yet, or it is a folder with no entries at all. */
+function isNewOrEmptyFolder(path: string): boolean {
+  const st = statSync(path, { throwIfNoEntry: false });
+  if (!st) return true;
+  if (!st.isDirectory()) return false;
+  try {
+    return readdirSync(path).length === 0;
+  } catch {
+    return false; // unreadable: cannot tell, so not empty
+  }
+}
+
 /** Environment for child `claude`/`gh` checks, without variables of an enclosing Claude session. */
 function cleanEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -149,12 +162,14 @@ async function cmdInit(home: Home, args: string[]): Promise<void> {
     // Brand-new project: create a repository with one commit so worktrees have a base.
     if (/^[a-z]+:\/\//.test(source) || source.startsWith('git@')) fail('--create only works with a local path');
     if (existsSync(join(source, '.git'))) fail(`${source} is already a git repository (drop --create)`);
+    // Only a new or empty folder: files already there would be overwritten or committed, secrets included.
+    if (!isNewOrEmptyFolder(source)) fail(`${source} is not an empty folder: drop --create to use an existing repository, or choose an empty or new folder`);
     mkdirSync(source, { recursive: true });
     const g = (...a: string[]) => execFileSync('git', a, { cwd: source, stdio: 'ignore', env: gitEnv() }); // no GIT_DIR & co. from a calling hook
     g('init', '-q', '-b', values.target ?? 'main');
     writeFileSync(join(source, 'README.md'), `# ${values.name ?? id}\n\nBuilt with StayOn Autopilot.\n`);
     writeFileSync(join(source, '.gitignore'), 'node_modules/\n.env*\n!.env.example\ndist/\n.expo/\ncoverage/\n');
-    g('add', '.');
+    g('add', '--', 'README.md', '.gitignore');
     g('-c', 'user.name=StayOn Autopilot', '-c', 'user.email=autopilot@localhost', 'commit', '-q', '-m', 'Initial commit');
     process.stdout.write(`Created repository ${source}\n`);
   }

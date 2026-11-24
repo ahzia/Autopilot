@@ -65,6 +65,50 @@ test('init --create makes a repo and a valid config; task and decision commands 
   }
 });
 
+test('init --create refuses a folder that is not empty and writes nothing', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'ap-cli-'));
+  try {
+    const home = join(tmp, 'home');
+    const existing = join(tmp, 'existing');
+    mkdirSync(join(existing, 'notes'), { recursive: true });
+    writeFileSync(join(existing, 'README.md'), 'my readme\n');
+    writeFileSync(join(existing, '.gitignore'), 'secret.txt\n');
+    writeFileSync(join(existing, 'secret.txt'), 'not a real secret\n');
+    writeFileSync(join(existing, 'notes', 'a.md'), 'notes\n');
+    const refused = run(['init', 'ex1', '--home', home, '--source', existing, '--create', '--runner', 'fake']);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /existing is not an empty folder: drop --create to use an existing repository, or choose an empty or new folder/);
+    assert.equal(refused.stdout, '');
+    assert.equal(existsSync(join(existing, '.git')), false);
+    assert.equal(readFileSync(join(existing, 'README.md'), 'utf8'), 'my readme\n');
+    assert.equal(readFileSync(join(existing, '.gitignore'), 'utf8'), 'secret.txt\n');
+    assert.equal(existsSync(join(home, 'projects', 'ex1')), false);
+
+    // A file is not a folder either.
+    const file = join(tmp, 'file.txt');
+    writeFileSync(file, 'x');
+    const notDir = run(['init', 'ex2', '--home', home, '--source', file, '--create']);
+    assert.equal(notDir.status, 1);
+    assert.match(notDir.stderr, /file\.txt is not an empty folder/);
+    assert.equal(readFileSync(file, 'utf8'), 'x');
+    assert.equal(existsSync(join(home, 'projects', 'ex2')), false);
+
+    // An empty folder, or a missing one with missing parents, gets a repository holding only init's two files.
+    const empty = join(tmp, 'empty');
+    mkdirSync(empty);
+    const missing = join(tmp, 'new', 'deeper', 'app');
+    for (const [id, dir] of [['empty-app', empty], ['new-app', missing]]) {
+      const ok = run(['init', id, '--home', home, '--source', dir, '--create', '--runner', 'fake']);
+      assert.equal(ok.status, 0, ok.stderr);
+      const committed = execFileSync('git', ['ls-tree', '-r', '--name-only', 'HEAD'], { cwd: dir, encoding: 'utf8' });
+      assert.deepEqual(committed.split('\n').filter(Boolean).sort(), ['.gitignore', 'README.md']);
+      assert.ok(existsSync(join(home, 'projects', id, 'config.json')));
+    }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('an invalid config is reported, never silently used', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'ap-cli-'));
   try {

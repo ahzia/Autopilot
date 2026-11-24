@@ -82,10 +82,12 @@ its tasks and cards in the database and the inbox).
 
 ## 4. Create a real project
 
-New repository:
+New repository (`--source` must be a new or empty folder, so keep the
+documents somewhere else; `init` refuses a folder that already holds files and
+writes nothing):
 
 ```bash
-autopilot init my-app --create --source /path/to/my-app --name "My App" --docs /path/to/my-app/docs/product.md,/path/to/my-app/docs/architecture.md --check "typecheck=npm run typecheck" --check "test=npm test" --setup "npm install"
+autopilot init my-app --create --source /path/to/my-app --name "My App" --docs /path/to/notes/product.md,/path/to/notes/architecture.md --check "typecheck=npm run typecheck" --check "test=npm test" --setup "npm install"
 ```
 
 Existing repository: drop `--create` and point `--source` at it. The autopilot

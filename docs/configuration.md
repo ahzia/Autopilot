@@ -29,7 +29,7 @@ rebuilds it from the defaults and your flags, so hand edits are lost.
 | --- | --- | --- |
 | `<id>` (required) | `id` | 2-40 characters: lowercase letters, digits and `-`, not starting with `-`. |
 | `--source <path or URL>` (required) | `repo.source` | A local path is made absolute from your current directory (`~` is expanded). URLs (`https://…`, `ssh://…`) and `git@…` addresses are kept as written. |
-| `--create` | | Creates a new git repository at `--source` (local paths only) with a README, a `.gitignore` and one commit on the target branch. |
+| `--create` | | Creates a new git repository at `--source` (local paths only) with a README, a `.gitignore` and one commit on the target branch. The folder must be new or empty: if it already holds anything, `init` stops and writes nothing. Missing parent folders are created. |
 | `--docs a.md,b.md` | `docs` | Comma-separated and repeatable. Made absolute from your current directory. |
 | `--forge local\|github`, `--github owner/name` | `repo.forge`, `repo.github` | `--github` is required with `--forge github`. |
 | `--target <branch>` | `repo.targetBranch` | With `--create`, also the name of the first branch. |
