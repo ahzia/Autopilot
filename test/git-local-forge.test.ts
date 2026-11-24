@@ -22,10 +22,15 @@ import {
   runCommand,
 } from '../src/git/git.ts';
 import type { CheckResult, Task } from '../src/types.ts';
+import { SAFE_GIT_FLAGS, findSecrets, scrubbedEnv } from '../src/util.ts';
 
 // Keep the developer's own git configuration (signing, hooks, default branch) out of these tests.
 process.env.GIT_CONFIG_GLOBAL = os.devNull;
 process.env.GIT_CONFIG_NOSYSTEM = '1';
+// A worker run's own git ignores replace refs (GIT_NO_REPLACE_OBJECTS, GIT_GRAFT_FILE, and
+// core.useReplaceRefs=false in GIT_CONFIG_PARAMETERS): keep that out of the plain git these tests
+// compare the forge with, or they fail when a builder runs them.
+for (const key of ['GIT_NO_REPLACE_OBJECTS', 'GIT_GRAFT_FILE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT']) delete process.env[key];
 
 const AUTHOR = ['-c', 'user.name=Test Founder', '-c', 'user.email=founder@example.com'];
 
@@ -578,6 +583,53 @@ test('worker-written hooks and fsmonitor never run in the supervisor; risky conf
   assert.equal(await sh(forge.repoPath, 'config', '--get', 'remote.origin.url'), forge.source);
   assert.equal(await sh(forge.repoPath, 'config', '--get-all', 'remote.origin.fetch'), ORIGIN_FETCH_REFSPEC);
   assert.equal(fs.existsSync(marker), false);
+});
+
+test('replace refs a worker writes never change what the forge diffs, scans or merges', async (t) => {
+  const { forge } = await setup(t);
+  const target = await forge.targetHead();
+  const wt = await forge.createWorktree('T-1', 'feature');
+  // Plain git, as a builder runs it in its worktree (it honors replace refs).
+  const worker = async (...args: string[]) => {
+    const r = await runCommand('git', [...AUTHOR, ...args], { cwd: wt.path });
+    assert.equal(r.code, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  const hidden = '.autopilot/evil.json';
+  const real = [hidden, 'feature.txt'];
+  fs.mkdirSync(path.join(wt.path, '.autopilot'));
+  fs.writeFileSync(path.join(wt.path, hidden), 'aws_key = "AKIAABCDEFGHIJKLMNOP"\n');
+  fs.writeFileSync(path.join(wt.path, 'feature.txt'), 'feature\n');
+  // A stand-in for the target commit that already has the hidden file, then the real work on top.
+  await worker('add', hidden);
+  const fakeTarget = await worker('commit-tree', await worker('write-tree'), '-m', 'initial');
+  await worker('replace', target, fakeTarget);
+  await worker('add', 'feature.txt');
+  await worker('commit', '-q', '-m', 'feature');
+  const head = await worker('rev-parse', 'HEAD');
+  assert.equal(await worker('diff', '--name-only', target, head), 'feature.txt', 'sanity check: plain git hides the file');
+
+  const paths = async (from: string, to: string) => (await forge.diff(from, to, 2_000_000)).files.map((f) => f.path).sort();
+  assert.deepEqual(await paths(target, head), real);
+  assert.deepEqual(findSecrets((await forge.diff(target, head, 2_000_000)).patch).map((s) => s.file), [hidden]);
+  // Whatever environment a caller passes, and with the supervisor's flags and scrubbed environment.
+  assert.equal((await git(['ls-tree', '--name-only', target], { cwd: forge.repoPath, env: { ...process.env } })).stdout.trim(), 'README.md');
+  const scrubbed = await runCommand('git', [...SAFE_GIT_FLAGS, 'ls-tree', '--name-only', target], { cwd: forge.repoPath, env: scrubbedEnv() });
+  assert.equal(scrubbed.stdout.trim(), 'README.md');
+
+  // The merge is built from the real objects, so what was diffed is exactly what lands.
+  const task = makeTask({ branch: wt.branch, worktree: wt.path, baseCommit: target, headCommit: head });
+  const res = await forge.integrate(task, head, checks());
+  assert.equal(res.status, 'merged', res.details);
+  assert.equal(await sh(forge.repoPath, 'rev-parse', `${res.mergedCommit}^1`), target);
+  assert.deepEqual(await paths(target, res.mergedCommit!), real);
+
+  // The GitHub variant: a clean stand-in for the head itself (git push sends the real head).
+  await worker('replace', '-d', target);
+  await worker('rm', '-q', '--cached', hidden);
+  await worker('replace', head, await worker('commit-tree', await worker('write-tree'), '-p', target, '-m', 'feature'));
+  assert.equal(await worker('diff', '--name-only', target, head), 'feature.txt', 'sanity check: plain git hides the file');
+  assert.deepEqual(await paths(target, head), real);
 });
 
 test('leftover lock files or a broken index never block later integrations', async (t) => {

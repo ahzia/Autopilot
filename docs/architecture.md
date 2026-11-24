@@ -147,11 +147,19 @@ Within that model:
   `autopilot run --accept-config` skips this when you edited the files yourself.
 * **No repository hooks in supervisor git commands.** Every git command the
   supervisor runs uses `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
-  `core.untrackedCache=false` and `protocol.ext.allow=never`. The git commands
-  it runs inside builder worktrees, and all check commands, also run with
-  Claude/GitHub/cloud credentials removed from the environment; fetches, pushes
-  and merges in the private clone keep your environment because they may need
-  your git credentials.
+  `core.untrackedCache=false` and `protocol.ext.allow=never`, and ignores
+  replace refs and grafts (`core.useReplaceRefs=false`,
+  `GIT_NO_REPLACE_OBJECTS=1` and `GIT_GRAFT_FILE=/dev/null/no-grafts`, a file
+  that cannot exist), so a worker that writes `refs/replace/*` or `info/grafts`
+  cannot make the supervisor diff, scan or review other objects or history than
+  the ones it merges and pushes. Every worker run gets the two variables as
+  well, and `core.useReplaceRefs=false` in `GIT_CONFIG_PARAMETERS` (after any
+  settings already there, as `git -c` passes them on), so a reviewer's own
+  `git diff` and `git log` show the same commits. The git commands the
+  supervisor runs inside builder worktrees, and all check commands, also run
+  with Claude/GitHub/cloud credentials removed from the environment; fetches,
+  pushes and merges in the private clone keep your environment because they may
+  need your git credentials.
 * **Secrets.** Leftover files are auto-committed only if they do not look like
   secrets (`.env*`, keys, credentials); every branch's net changes (its diff
   against the base, up to 2 MB) are scanned for secret-looking values before it
@@ -205,4 +213,4 @@ runner against temporary repositories:
 | GitHub feedback (`github-feedback.test.ts`) | Trusted change request repairs once even if redelivered; untrusted comments ignored; a trusted GitHub approval of the exact head merges and supersedes the card; feedback after merge becomes a follow-up task; `/approve` needs the card's one-time code. |
 | Target branch tampering | A builder that moves `main` is caught; `main` restored; project paused with an urgent card; the work later merges only through the gate. |
 | Quota governor | After a usage warning, later builders start only when no other builder runs. |
-| Regressions (`regressions.test.ts`) | Policy edits need approval and update the runtime in place; a rejected revision never merges; cancelling one task keeps a shared card for the others; no cancel during a merge; secrets never published or merged; an answer arriving before the run ends resumes without a second card; a builder that switches branches keeps its work; after merging `main` into its branch, a task is judged only on its own changes. |
+| Regressions (`regressions.test.ts`) | Policy edits need approval and update the runtime in place; a rejected revision never merges; cancelling one task keeps a shared card for the others; no cancel during a merge; secrets never published or merged; a replace ref cannot hide a change from the merge gate; an answer arriving before the run ends resumes without a second card; a builder that switches branches keeps its work; after merging `main` into its branch, a task is judged only on its own changes. |

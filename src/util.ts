@@ -74,7 +74,9 @@ export const NEVER_AUTO_COMMIT = /(^|\/)(\.env(?!\.example|\.sample|\.template)[
 
 /**
  * Environment for commands the supervisor runs over builder-controlled files
- * (git in worktrees, checks): no Claude/GitHub/cloud credentials.
+ * (git in worktrees, checks): no Claude/GitHub/cloud credentials, no git prompts,
+ * and git ignores replace refs and grafts (refs/replace/*, info/grafts, which workers
+ * can write), as with FORCED_GIT_ENV in git/git.ts.
  */
 export function scrubbedEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
@@ -84,11 +86,16 @@ export function scrubbedEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
     env[k] = v;
   }
   env.GIT_TERMINAL_PROMPT = '0';
+  env.GIT_NO_REPLACE_OBJECTS = '1';
+  env.GIT_GRAFT_FILE = '/dev/null/no-grafts'; // a file that cannot exist: no grafts, and no hint
   return env;
 }
 
-/** git flags that stop repository-controlled hooks and helpers from running. */
-export const SAFE_GIT_FLAGS = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'protocol.ext.allow=never'];
+/**
+ * git flags that stop repository-controlled hooks and helpers from running, and keep replace refs
+ * off even where the repository's config switches them on (see HARDENING_CONFIG in git/git.ts).
+ */
+export const SAFE_GIT_FLAGS = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'protocol.ext.allow=never', '-c', 'core.useReplaceRefs=false'];
 
 /** Keep the last `max` characters of a string, cut at a line boundary when possible. */
 export function tail(text: string, max = 4000): string {

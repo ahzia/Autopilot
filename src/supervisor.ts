@@ -944,8 +944,20 @@ export class Supervisor implements SupervisorActions {
       maxTurns: cfg.execution.maxTurns,
       timeoutMs: cfg.execution.runTimeoutMinutes * MIN,
       idleTimeoutMs: cfg.execution.idleTimeoutMinutes * MIN,
-      // Startup failures then still end with a structured result message.
-      env: { AUTOPILOT_TASK_ID: r.task?.id ?? '', AUTOPILOT_ROLE: r.role, CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1' },
+      // Startup failures then still end with a structured result message. The run's git ignores
+      // replace refs and grafts like the supervisor's own (FORCED_GIT_ENV in git/git.ts), so a
+      // reviewer sees what would merge. Git before 2.42 let core.useReplaceRefs=true in the
+      // repository's config (workers can write it) outrank GIT_NO_REPLACE_OBJECTS, so the run's
+      // git also gets core.useReplaceRefs=false the way `git -c` passes settings on: appended to
+      // GIT_CONFIG_PARAMETERS, which every git version reads after all config files.
+      env: {
+        AUTOPILOT_TASK_ID: r.task?.id ?? '',
+        AUTOPILOT_ROLE: r.role,
+        CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1',
+        GIT_NO_REPLACE_OBJECTS: '1',
+        GIT_GRAFT_FILE: '/dev/null/no-grafts',
+        GIT_CONFIG_PARAMETERS: [process.env.GIT_CONFIG_PARAMETERS, "'core.useReplaceRefs=false'"].filter(Boolean).join(' '),
+      },
       logPath,
     };
     const handle = rt.runner.start(spec, (e) => this.onRunEvent(r.runId, e));

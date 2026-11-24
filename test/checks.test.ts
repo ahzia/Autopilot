@@ -464,6 +464,25 @@ test('a setup that rewrites a lockfile (like npm install) is not repeated on eve
   assert.equal(fs.readFileSync(counter, 'utf8'), 'x');
 });
 
+test("setup's own git never runs an fsmonitor program from the worktree's git config", async (t) => {
+  const dir = tmpDir(t, 'ap-setup-');
+  const repo = makeRepo(dir);
+  const ran = path.join(dir, 'fsmonitor-ran.txt');
+  const program = path.join(dir, 'fsmonitor.sh');
+  fs.writeFileSync(program, `#!/bin/sh\necho ran >> '${ran}'\nexit 1\n`);
+  fs.chmodSync(program, 0o755);
+  // What a worker could write into the shared repository config from its worktree.
+  git(repo, 'config', 'core.fsmonitor', program);
+  git(repo, 'ls-files', '--cached', '--others', '--exclude-standard');
+  assert.ok(fs.existsSync(ran), 'sanity check: plain git runs it');
+  fs.rmSync(ran);
+
+  const runner = new CommandCheckRunner({ setup: [[NODE, '-e', '']], commands: [] });
+  assert.equal((await runner.setup(repo))[0]?.status, 'passed');
+  assert.deepEqual(await runner.setup(repo), [], 'the marker was found');
+  assert.equal(fs.existsSync(ran), false, 'no fsmonitor program ran');
+});
+
 test('setups in one worktree never overlap, even from different runner instances', async (t) => {
   const dir = tmpDir(t, 'ap-setup-');
   const repo = makeRepo(dir);

@@ -226,7 +226,7 @@ export class GitError extends Error {
 
 export interface GitOptions {
   cwd: string;
-  /** Defaults to gitEnv() (process.env without repository-redirecting variables). */
+  /** Defaults to gitEnv() (process.env without repository-redirecting variables). Prompts, replace refs and grafts stay off. */
   env?: NodeJS.ProcessEnv;
   /** Default 120 s. */
   timeoutMs?: number;
@@ -245,6 +245,8 @@ export type GitResult = CommandResult;
  * (a doctored one could hide files from `git status`), no ext:: transport. Workers can write the
  * shared repository's config, index and hooks directory (their commits go through it), and none
  * of that may run programs inside the supervisor. Same values as SAFE_GIT_FLAGS in util.ts.
+ * Replace refs are off through the environment too (FORCED_GIT_ENV), but git before 2.42 let a
+ * repository's core.useReplaceRefs=true switch them back on; command-line config always wins.
  */
 export const HARDENING_CONFIG: readonly string[] = [
   '-c',
@@ -255,6 +257,8 @@ export const HARDENING_CONFIG: readonly string[] = [
   'core.untrackedCache=false',
   '-c',
   'protocol.ext.allow=never',
+  '-c',
+  'core.useReplaceRefs=false',
 ];
 
 /**
@@ -272,21 +276,32 @@ const REPO_REDIRECT_VARS = [
   'GIT_PREFIX',
 ];
 
-/** process.env without repository-redirecting variables, with prompts disabled, plus `extra`. */
+/**
+ * Environment forced on every git command: never prompt, and ignore replace refs and grafts.
+ * Workers can write refs/replace/* and info/grafts in the shared repository; honoring them would
+ * let the supervisor diff, scan and review objects and history other than the ones the refs
+ * really point at (and that merges and pushes then use). Every worker run gets the last two too
+ * (Supervisor.startRun), so a reviewer's own git commands show the same commits. The graft file
+ * is one that cannot exist (/dev/null is no directory), so git reads no grafts and says nothing;
+ * GIT_GRAFT_FILE=/dev/null itself makes git print a deprecation hint on every command.
+ */
+const FORCED_GIT_ENV = { GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null/no-grafts' } as const;
+
+/** process.env without repository-redirecting variables, with FORCED_GIT_ENV, plus `extra`. */
 export function gitEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of REPO_REDIRECT_VARS) delete env[key];
-  return { ...env, GIT_TERMINAL_PROMPT: '0', ...extra };
+  return { ...env, ...FORCED_GIT_ENV, ...extra };
 }
 
 /**
- * Run git without a shell, with HARDENING_CONFIG and GIT_TERMINAL_PROMPT=0 always applied.
+ * Run git without a shell, with HARDENING_CONFIG and FORCED_GIT_ENV always applied.
  * Throws GitError on a non-zero exit unless allowFail is set.
  */
 export async function git(args: string[], opts: GitOptions): Promise<GitResult> {
   const res = await runCommand('git', [...HARDENING_CONFIG, ...args], {
     cwd: opts.cwd,
-    env: { ...(opts.env ?? gitEnv()), GIT_TERMINAL_PROMPT: '0' },
+    env: { ...(opts.env ?? gitEnv()), ...FORCED_GIT_ENV },
     timeoutMs: opts.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
     input: opts.input,
     maxStdoutBytes: opts.maxStdoutBytes,

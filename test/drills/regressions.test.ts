@@ -140,6 +140,40 @@ test('secret-looking content is never published or merged', T, async () => {
   }
 });
 
+test('a replace ref cannot hide a change from the merge gate', T, async () => {
+  const h = await harness({
+    behavior: (spec) => async (ctl) => {
+      if (spec.role === 'reviewer') return { status: 'succeeded', structuredOutput: approve };
+      const asWorker = (...args: string[]) => ctl.git(['-c', 'user.name=F', '-c', 'user.email=f@x', ...args]);
+      if (spec.prompt.includes('Protected files')) {
+        await ctl.git(['rm', '-q', '-r', '.autopilot']);
+        await asWorker('commit', '-m', 'revert policy edit');
+        return { status: 'succeeded', structuredOutput: builderResult('completed') };
+      }
+      // Make the target commit read as if it already had the policy file, then add it for real.
+      const target = (await ctl.git(['rev-parse', 'HEAD'])).trim();
+      ctl.writeFile('.autopilot/policy.json', '{"autoMerge":"everything"}\n');
+      await ctl.git(['add', '.autopilot/policy.json']);
+      const standIn = (await asWorker('commit-tree', (await ctl.git(['write-tree'])).trim(), '-m', 'initial')).trim();
+      await ctl.git(['replace', target, standIn]);
+      ctl.writeFile('feature.txt', 'f\n');
+      await ctl.git(['add', 'feature.txt']);
+      await asWorker('commit', '-m', 'feature and policy');
+      return { status: 'succeeded', structuredOutput: builderResult('completed') };
+    },
+  });
+  try {
+    const t = h.addTask('Hidden');
+    await h.sup.start();
+    await h.waitState(t.id, 'integrated');
+    assert.ok(h.store.listEvents({ types: ['merge.classified'] }).some((e) => e.message.includes('reject')), 'the hidden policy edit was seen');
+    assert.equal(h.readTarget('.autopilot/policy.json'), null);
+    assert.equal(h.readTarget('feature.txt'), 'f\n');
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test('an answer that arrives before the asking run ends resumes it without a second card', T, async () => {
   let h!: Harness;
   let asked = 0;

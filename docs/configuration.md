@@ -402,4 +402,6 @@ Variables the autopilot sets:
 | `AUTOPILOT_PORT_BASE` | setup and check commands | A port number between 40000 and 48990, derived from the worktree's path, so parallel worktrees normally get different blocks of 10 ports. Test servers can use `AUTOPILOT_PORT_BASE` to `AUTOPILOT_PORT_BASE + 9`. |
 | `AUTOPILOT_TASK_ID`, `AUTOPILOT_ROLE` | Claude workers | The task id (for example `T-1`; empty for the planner) and the role: `builder`, `reviewer` or `planner`. |
 | `CLAUDE_CODE_STARTUP_FAILURE_RESULTS` | Claude workers | `1`, so a worker that fails to start still reports a result. |
+| `GIT_NO_REPLACE_OBJECTS`, `GIT_GRAFT_FILE` | Claude workers and the autopilot's own git | `1` and `/dev/null/no-grafts` (a path that cannot exist), so git ignores replace refs and grafts that a worker writes into the shared repository. |
+| `GIT_CONFIG_PARAMETERS` | Claude workers | Your value, if any, plus `core.useReplaceRefs=false`: git before 2.42 lets a repository's own config switch replace refs back on. The autopilot's own git passes the same setting with `-c`. |
 | `AUTOPILOT_API_URL`, `AUTOPILOT_RUN_TOKEN` | the autopilot's tool bridge | The local API address and the run's token. They are internal; do not set them yourself. |

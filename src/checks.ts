@@ -11,7 +11,7 @@ import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 import type { ProjectConfig } from './config.ts';
 import type { CheckResult, CheckRunner, CheckStatus } from './types.ts';
-import { redactSecrets, sha256Hex, tail } from './util.ts';
+import { redactSecrets, SAFE_GIT_FLAGS, scrubbedEnv, sha256Hex, tail } from './util.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -318,10 +318,18 @@ export class CommandCheckRunner implements CheckRunner {
     for (const abort of [...this.running]) abort();
   }
 
+  /**
+   * Environment for git in a builder-controlled worktree: checkEnv, and like the supervisor's own
+   * git (with SAFE_GIT_FLAGS) no credentials, no prompts and no replace refs.
+   */
+  private gitEnv(cwd: string): NodeJS.ProcessEnv {
+    return scrubbedEnv(checkEnv(this.baseEnv, cwd));
+  }
+
   private async markerPath(cwd: string): Promise<string> {
-    const { stdout } = await execFileAsync('git', ['rev-parse', '--git-path', SETUP_MARKER], {
+    const { stdout } = await execFileAsync('git', [...SAFE_GIT_FLAGS, 'rev-parse', '--git-path', SETUP_MARKER], {
       cwd,
-      env: checkEnv(this.baseEnv, cwd),
+      env: this.gitEnv(cwd),
       timeout: 30_000,
       encoding: 'utf8',
     });
@@ -336,9 +344,9 @@ export class CommandCheckRunner implements CheckRunner {
    * of every dependency file in the worktree (tracked, or untracked and not ignored).
    */
   private async setupFingerprint(cwd: string): Promise<string> {
-    const { stdout } = await execFileAsync('git', LS_FILES_ARGS, {
+    const { stdout } = await execFileAsync('git', [...SAFE_GIT_FLAGS, ...LS_FILES_ARGS], {
       cwd,
-      env: checkEnv(this.baseEnv, cwd),
+      env: this.gitEnv(cwd),
       timeout: 60_000,
       maxBuffer: 256 * 1024 * 1024,
       encoding: 'utf8',
