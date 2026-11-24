@@ -9,7 +9,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { killAllCheckProcesses } from './checks.ts';
 import { configHash, DEFAULT_DISALLOWED_TOOLS, profileAllowsDispatch, stableStringify, type ProjectConfig } from './config.ts';
-import { git } from './git/git.ts';
+import { git, redact, type GitOptions } from './git/git.ts';
 import type { Home } from './home.ts';
 import { classifyMerge, reviewCardText, type MergeVerdict } from './policy/merge-policy.ts';
 import { ownershipOverlaps } from './policy/glob.ts';
@@ -49,10 +49,13 @@ import type {
   Task,
   TaskState,
 } from './types.ts';
-import { findSecrets, NEVER_AUTO_COMMIT, randomToken, SAFE_GIT_FLAGS, scrubbedEnv, sha256Hex, slugify, uuid } from './util.ts';
+import { findSecrets, NEVER_AUTO_COMMIT, randomToken, SAFE_GIT_FLAGS, scrubbedEnv, secretKinds, sha256Hex, slugify, uuid } from './util.ts';
 
 /** git over builder-controlled worktrees: no repository hooks/helpers, no credentials in the environment. */
-const safeGit = (args: string[], opts: { cwd: string; allowFail?: boolean }) => git([...SAFE_GIT_FLAGS, ...args], { ...opts, env: scrubbedEnv() });
+const safeGit = (args: string[], opts: Omit<GitOptions, 'env'>) => git([...SAFE_GIT_FLAGS, ...args], { ...opts, env: scrubbedEnv() });
+
+/** The secret scan reads at most this much patch text of a branch's commits; beyond it, it fails closed. */
+const SECRET_SCAN_MAX_BYTES = 32 * 1024 * 1024;
 
 export interface ProjectRuntime {
   cfg: ProjectConfig;
@@ -1211,17 +1214,21 @@ export class Supervisor implements SupervisorActions {
       return;
     }
 
-    // Never publish (or later merge) something that looks like a secret.
+    // Never publish (or later merge) something that looks like a secret, in any commit of the branch.
     const base = await this.diffBase(rt, t, head);
-    const secrets = findSecrets((await rt.forge.diff(base, head, 2_000_000)).patch);
-    if (secrets.length) {
+    const scan = await this.scanCommits(rt, base, head);
+    if (scan.secrets.length) {
       this.repairLeased(
         rt,
         t,
         runId,
         run.generation,
-        `Secret-looking content was committed (${secrets.map((s) => `${s.kind} in ${s.file}`).join('; ')}). Remove it and rewrite this branch's history so no commit contains it (the branch was not published), e.g. with an interactive-free \`git reset --soft ${base.slice(0, 12)}\` and a fresh commit. Use placeholders or .env.example instead.`,
+        `Secret-looking content was committed (${scan.secrets.map((s) => `${s.kind} in ${s.file}`).join('; ')}). Remove it and rewrite this branch's history so no commit contains it (the branch was not published), e.g. with an interactive-free \`git reset --soft ${base.slice(0, 12)}\` and a fresh commit. Use placeholders or .env.example instead.`,
       );
+      return;
+    }
+    if (scan.incomplete) {
+      this.repairLeased(rt, t, runId, run.generation, `The branch was not published: the secret scan could not check all of its commits (${scan.incomplete}).`);
       return;
     }
 
@@ -1246,6 +1253,53 @@ export class Supervisor implements SupervisorActions {
       if (mb.code === 0 && /^[0-9a-f]{40}$/.test(sha)) return sha;
     }
     return t.baseCommit ?? head;
+  }
+
+  /**
+   * Secret-looking values added by any commit in base..head, not only by the branch's net change:
+   * a secret committed and removed again is still in the history that a push publishes and the
+   * "merge" strategy keeps. Merge commits count with the changes they make themselves (--cc), root
+   * commits (an unrelated history) with all their content (--root, whatever log.showRoot says).
+   * The full message of every commit is scanned too: the same push and strategy keep it.
+   * When the history cannot be read completely (git failed, or more than SECRET_SCAN_MAX_BYTES of
+   * patches or of messages), `incomplete` says why; callers treat that like a finding, so nothing
+   * unscanned is published or merged.
+   */
+  private async scanCommits(rt: ProjectRuntime, base: string, head: string): Promise<{ secrets: { file: string; kind: string }[]; incomplete: string | null }> {
+    if (!rt.barePath) return { secrets: [], incomplete: 'the repository is not ready' };
+    const range = `${base}..${head}`;
+    const opts = { cwd: rt.barePath, allowFail: true, maxStdoutBytes: SECRET_SCAN_MAX_BYTES, stopAtMaxStdout: true };
+    const flags = ['--no-ext-diff', '--no-textconv', '--no-color', '--no-show-signature', '--format=%H'];
+    const patches = await safeGit(['log', '-p', '--cc', '--root', '-M', ...flags, range, '--'], opts);
+    // Merge commits once more without rename detection, for file names only: a merge that just
+    // renames a file every parent holds (to .env, say) is in no parent's way, so the combined diff
+    // above shows nothing for it. Lines stay with the pass above, which does not report again a
+    // line that the target added to a file this branch renamed.
+    const merges = await safeGit(['log', '-p', '--merges', '--cc', '--no-renames', ...flags, range, '--'], opts);
+    // One NUL-terminated "<sha>\n<message>" record per commit, in UTF-8 whatever
+    // i18n.logOutputEncoding in the (worker-writable) repository config says. Not caught here: text
+    // after a NUL (git commit refuses one, `git hash-object --literally` does not, and %B stops
+    // there), and a message whose own encoding header (e.g. UTF-16LE) re-codes it into other text.
+    const messages = await safeGit(['log', '-z', '--no-show-signature', '--encoding=UTF-8', '--format=%H%n%B', range, '--'], opts);
+    const secrets = findSecrets(patches.stdout);
+    for (const s of findSecrets(merges.stdout)) {
+      if (s.kind === 'environment file' && !secrets.some((x) => x.file === s.file && x.kind === s.kind)) secrets.push(s);
+    }
+    for (const record of messages.stdout.split('\0')) {
+      const nl = record.indexOf('\n');
+      if (nl < 0) continue;
+      for (const kind of secretKinds(record.slice(nl + 1))) secrets.push({ file: `the message of commit ${record.slice(0, 12)}`, kind });
+    }
+    const limit = `${SECRET_SCAN_MAX_BYTES / 1024 / 1024} MiB`;
+    const rewrite = `e.g. with an interactive-free \`git reset --soft ${base.slice(0, 12)}\` and a fresh commit`;
+    if (patches.stdoutTruncated || merges.stdoutTruncated) {
+      return { secrets, incomplete: `its commits change more than ${limit} of text: keep generated and very large files out of the branch history, ${rewrite}` };
+    }
+    if (messages.stdoutTruncated) return { secrets, incomplete: `its commit messages hold more than ${limit} of text: shorten them, ${rewrite}` };
+    for (const r of [patches, merges, messages]) {
+      if (r.code !== 0) return { secrets, incomplete: `git log failed: ${redact(r.stderr.trim() || `exit ${r.code}`).slice(0, 300)}` };
+    }
+    return { secrets, incomplete: null };
   }
 
   private exhaust(t: Task, owner: string, generation: number, why: string): void {
@@ -1545,9 +1599,13 @@ export class Supervisor implements SupervisorActions {
       }
       const base = await this.diffBase(rt, t, head);
       const diff = await rt.forge.diff(base, head, 2_000_000);
-      const secrets = findSecrets(diff.patch);
-      if (secrets.length) {
-        this.repairLeased(rt, t, owner, generation, `Secret-looking content is in this branch (${secrets.map((s) => `${s.kind} in ${s.file}`).join('; ')}). Remove it from every commit before it can merge.`);
+      const scan = await this.scanCommits(rt, base, head);
+      if (scan.secrets.length) {
+        this.repairLeased(rt, t, owner, generation, `Secret-looking content is in this branch (${scan.secrets.map((s) => `${s.kind} in ${s.file}`).join('; ')}). Remove it from every commit before it can merge.`);
+        return;
+      }
+      if (scan.incomplete) {
+        this.repairLeased(rt, t, owner, generation, `Not merged: the secret scan could not check all of this branch's commits (${scan.incomplete}).`);
         return;
       }
       const checks = this.store.latestChecks(t.id, head, 'branch');

@@ -50,23 +50,80 @@ const SECRET_PATTERNS: [string, RegExp][] = [
   ['Supabase service role key', /service_role[^\n]{0,40}eyJ[A-Za-z0-9_-]{20,}/],
 ];
 
+/** The kinds of secret-looking values in a piece of text, such as a commit message. */
+export function secretKinds(text: string): string[] {
+  return SECRET_PATTERNS.filter(([, re]) => re.test(text)).map(([kind]) => kind);
+}
+
 /**
- * Secret-looking values on the added lines of a unified diff. A cheap guard
- * before anything is published or merged; not a replacement for a real scanner.
+ * A path as git prints it in a diff header: as is, or C-quoted when it holds unusual bytes (any
+ * non-ASCII byte, with the default core.quotePath), e.g. "b/caf\303\251/.env".
+ */
+function unquoteGitPath(path: string): string {
+  if (path.length < 2 || !path.startsWith('"') || !path.endsWith('"')) return path;
+  const escapes: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13 };
+  const bytes: number[] = [];
+  for (const m of path.slice(1, -1).matchAll(/\\([0-7]{3}|.)|([^\\]+)/gs)) {
+    if (m[2] !== undefined) bytes.push(...Buffer.from(m[2], 'utf8'));
+    else if (/^[0-7]{3}$/.test(m[1])) bytes.push(parseInt(m[1], 8));
+    else bytes.push(escapes[m[1]] ?? m[1].charCodeAt(0));
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+/**
+ * Secret-looking values on the added lines of a unified diff (or of `git log -p`
+ * output). A cheap guard before anything is published or merged; not a
+ * replacement for a real scanner.
+ *
+ * "--- " and "+++ " are file names only in a file's header, between its "diff "
+ * line and its first hunk ("@@"). Inside a hunk every line starts with its
+ * change marker, so "+++ x" there is the added line "++ x".
+ *
+ * A merge commit's combined diff (`diff --cc`, hunk headers with one "@" per
+ * parent plus one) has a marker column per parent. A line is added only when
+ * every column is "+": a line missing from just some parents is already in
+ * another one.
  */
 export function findSecrets(patch: string): { file: string; kind: string }[] {
   const out: { file: string; kind: string }[] = [];
   let file = '';
+  let inHeader = true;
+  let added = '+'; // the markers of an added line in the current hunk
   for (const line of patch.split('\n')) {
-    if (line.startsWith('+++ ')) {
-      file = line.replace(/^\+\+\+ (b\/)?/, '').trim();
-      if (/(^|\/)\.env(\.|$)(?!example|sample|template)/.test(file)) out.push({ file, kind: 'environment file' });
+    if (line.startsWith('diff ')) {
+      inHeader = true;
       continue;
     }
-    if (!line.startsWith('+') || line.startsWith('+++')) continue;
-    for (const [kind, re] of SECRET_PATTERNS) if (re.test(line)) out.push({ file, kind });
+    if (line.startsWith('@@')) {
+      inHeader = false;
+      added = '+'.repeat(/^@+/.exec(line)![0].length - 1);
+      continue;
+    }
+    if (inHeader) {
+      // A file's new name: "+++ b/<path>", or "rename to <path>" / "copy to <path>", the only
+      // name a rename or copy without content changes has (`git log -M`/`-C` print no "+++"),
+      // C-quoted when it holds unusual bytes.
+      const name = /^(\+\+\+ |rename to |copy to )(.*)$/.exec(line);
+      if (name) {
+        file = unquoteGitPath(name[2].trim());
+        if (name[1] === '+++ ') file = file.replace(/^b\//, '');
+        // Any case: on a case-insensitive file system .ENV is the same file as .env.
+        if (/(^|\/)\.env(\.|$)(?!example|sample|template)/i.test(file)) out.push({ file, kind: 'environment file' });
+      }
+      continue;
+    }
+    if (!line.startsWith(added)) continue;
+    for (const kind of secretKinds(line.slice(added.length))) out.push({ file, kind });
   }
-  return out.filter((x, i) => out.findIndex((y) => y.file === x.file && y.kind === x.kind) === i);
+  // One finding per file and kind, in order (a Set: a scan can cover up to 32 MiB of changes).
+  const seen = new Set<string>();
+  return out.filter((x) => {
+    const key = `${x.file}\0${x.kind}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** Untracked files the supervisor must never auto-commit on a builder's behalf. */

@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { approve, builderResult, commitFile, harness, type Harness } from './harness.ts';
+import { approve, builderResult, commitFile, git, harness, type Harness } from './harness.ts';
 import type { ProjectConfig } from '../../src/config.ts';
 import type { RunSpec } from '../../src/types.ts';
 
@@ -136,6 +136,216 @@ test('secret-looking content is never published or merged', T, async () => {
     assert.equal(builds, 2);
     assert.match(h.readTarget('config.ts')!, /process\.env/);
     assert.ok(h.store.getTask(t.id)!.notes.some((n) => n.text.includes('Secret-looking content')));
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a secret committed and removed again in a later commit is still caught', T, async () => {
+  const key = `sk-ant-${'b'.repeat(40)}`;
+  let builds = 0;
+  const h = await harness({
+    config: (c) => {
+      c.integration.strategy = 'merge'; // the target keeps every commit of the branch
+    },
+    behavior: (spec) => async (ctl) => {
+      if (spec.role === 'reviewer') return { status: 'succeeded', structuredOutput: approve };
+      builds++;
+      if (builds === 1) {
+        await commitFile(ctl, 'config.ts', `export const key = "${key}";\n`, 'oops');
+        await commitFile(ctl, 'config.ts', 'export const key = process.env.API_KEY;\n', 'read key from env');
+      } else {
+        const base = /git reset --soft ([0-9a-f]{12})/.exec(spec.prompt)![1];
+        await ctl.git(['reset', '--soft', base]);
+        await ctl.git(['-c', 'user.name=F', '-c', 'user.email=f@x', 'commit', '-m', 'read key from env']);
+      }
+      return { status: 'succeeded', structuredOutput: builderResult('completed') };
+    },
+  });
+  try {
+    const t = h.addTask('Config');
+    await h.sup.start();
+    await h.waitState(t.id, 'integrated');
+    assert.equal(builds, 2, 'the branch with the secret in its history was sent back');
+    assert.ok(h.store.getTask(t.id)!.notes.some((n) => n.text.includes('Secret-looking content was committed (Anthropic API key in config.ts)')));
+    assert.match(h.readTarget('config.ts')!, /process\.env/);
+    assert.equal(git(h.bare, 'log', '-p', 'main').includes(key), false, 'no commit on main contains the key');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a .env file that a branch reaches only by renaming another file is still caught', T, async () => {
+  for (const variant of ['in an ordinary commit', 'inside a merge commit']) {
+    let builds = 0;
+    const id = ['-c', 'user.name=F', '-c', 'user.email=f@x'];
+    const h = await harness({
+      behavior: (spec) => async (ctl) => {
+        if (spec.role === 'reviewer') return { status: 'succeeded', structuredOutput: approve };
+        builds++;
+        if (builds === 1) {
+          await commitFile(ctl, 'settings.txt', 'DB_PASSWORD=hunter2hunter2\n', 'add settings');
+          if (variant === 'inside a merge commit') {
+            // Both parents of the merge hold settings.txt, so with rename detection the combined
+            // diff of the merge shows nothing at all.
+            const mine = (await ctl.git(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+            await ctl.git(['checkout', '-q', '-b', 'side']);
+            await commitFile(ctl, 'y.md', 'y\n', 'side work');
+            await ctl.git(['checkout', '-q', mine]);
+            await commitFile(ctl, 'x.md', 'x\n', 'more work');
+            await ctl.git([...id, 'merge', '-q', '--no-ff', '--no-commit', 'side']);
+          }
+          // A rename without content changes: `git log -M` prints "rename to .env" and no "+++ b/.env".
+          await ctl.git(['mv', 'settings.txt', '.env']);
+          await ctl.git([...id, 'commit', '-q', '-m', 'move settings to .env']);
+        } else {
+          const base = /git reset --soft ([0-9a-f]{12})/.exec(spec.prompt)![1];
+          await ctl.git(['reset', '--soft', base]);
+          await ctl.git(['rm', '-q', '--cached', '.env']);
+          await commitFile(ctl, 'settings.example', 'DB_PASSWORD=\n', 'placeholders only');
+        }
+        return { status: 'succeeded', structuredOutput: builderResult('completed') };
+      },
+    });
+    try {
+      const t = h.addTask('Settings');
+      await h.sup.start();
+      await h.waitState(t.id, 'integrated');
+      assert.equal(builds, 2, `the branch that renamed a file to .env was sent back (${variant})`);
+      assert.ok(h.store.getTask(t.id)!.notes.some((n) => n.text.includes('Secret-looking content was committed (environment file in .env)')), variant);
+      assert.equal(h.readTarget('.env'), null, variant);
+    } finally {
+      await h.cleanup();
+    }
+  }
+});
+
+test('a secret that only a merge commit adds is caught', T, async () => {
+  let builds = 0;
+  const h = await harness({
+    behavior: (spec) => async (ctl) => {
+      if (spec.role === 'reviewer') return { status: 'succeeded', structuredOutput: approve };
+      builds++;
+      const asWorker = (...args: string[]) => ctl.git(['-c', 'user.name=F', '-c', 'user.email=f@x', ...args]);
+      if (builds === 1) {
+        const branch = (await ctl.git(['symbolic-ref', '--short', 'HEAD'])).trim();
+        await ctl.git(['checkout', '-q', '-b', 'side-work']);
+        await commitFile(ctl, 'side.txt', 'side\n', 'side work');
+        await ctl.git(['checkout', '-q', branch]);
+        await commitFile(ctl, 'own.txt', 'own\n', 'own work');
+        await asWorker('merge', '-q', '--no-ff', '--no-commit', 'side-work');
+        ctl.writeFile('creds.ts', `export const id = "AKIA${'C'.repeat(16)}";\n`);
+        await ctl.git(['add', 'creds.ts']);
+        await asWorker('commit', '-q', '--no-edit');
+      } else {
+        const base = /git reset --soft ([0-9a-f]{12})/.exec(spec.prompt)![1];
+        await ctl.git(['rm', '-q', 'creds.ts']);
+        await ctl.git(['reset', '--soft', base]);
+        await asWorker('commit', '-q', '-m', 'side and own work');
+      }
+      return { status: 'succeeded', structuredOutput: builderResult('completed') };
+    },
+  });
+  try {
+    const t = h.addTask('Merger');
+    await h.sup.start();
+    await h.waitState(t.id, 'integrated');
+    assert.equal(builds, 2);
+    assert.ok(h.store.getTask(t.id)!.notes.some((n) => n.text.includes('AWS access key in creds.ts')));
+    assert.equal(h.readTarget('creds.ts'), null);
+    assert.equal(h.readTarget('side.txt'), 'side\n');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a secret in a root commit is caught even when the repository config hides root commits', T, async () => {
+  const h = await harness({
+    config: (c) => {
+      c.execution.maxRepairCycles = 0; // stop after the first finding
+    },
+    behavior: (spec) => async (ctl) => {
+      if (spec.role === 'reviewer') return { status: 'succeeded', structuredOutput: approve };
+      // log.showRoot=false hides root commits from `git log -p`; then start an unrelated history.
+      await ctl.git(['config', 'log.showRoot', 'false']);
+      await ctl.git(['checkout', '-q', '--orphan', 'fresh']);
+      await commitFile(ctl, 'z.txt', `token = "ghp_${'B'.repeat(36)}"\n`, 'root');
+      return { status: 'succeeded', structuredOutput: builderResult('completed') };
+    },
+  });
+  try {
+    const t = h.addTask('Orphan');
+    await h.sup.start();
+    await h.waitState(t.id, 'exhausted');
+    assert.ok(h.store.getTask(t.id)!.notes.some((n) => n.text.includes('GitHub token in z.txt')));
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a secret after more than 2 MB of other changes is still caught', T, async () => {
+  const token = `ghp_${'A'.repeat(36)}`;
+  let builds = 0;
+  const h = await harness({
+    behavior: (spec) => async (ctl) => {
+      if (spec.role === 'reviewer') return { status: 'succeeded', structuredOutput: approve };
+      builds++;
+      if (builds === 1) {
+        ctl.writeFile('a-data/fixture.txt', 'x'.repeat(2_100_000)); // one long line, diffed before z/
+        ctl.writeFile('z/client.ts', `export const token = "${token}";\n`);
+      } else {
+        const base = /git reset --soft ([0-9a-f]{12})/.exec(spec.prompt)![1];
+        await ctl.git(['reset', '--soft', base]);
+        ctl.writeFile('z/client.ts', 'export const token = process.env.GH_TOKEN;\n');
+      }
+      await ctl.git(['add', '-A']);
+      await ctl.git(['-c', 'user.name=F', '-c', 'user.email=f@x', 'commit', '-m', 'client']);
+      return { status: 'succeeded', structuredOutput: builderResult('completed') };
+    },
+  });
+  try {
+    const t = h.addTask('Client');
+    await h.sup.start();
+    await h.waitState(t.id, 'integrated');
+    assert.equal(builds, 2);
+    assert.ok(h.store.getTask(t.id)!.notes.some((n) => n.text.includes('GitHub token in z/client.ts')));
+    assert.match(h.readTarget('z/client.ts')!, /process\.env/);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('a branch whose history is too large to scan for secrets is never published or merged', T, async () => {
+  let builds = 0;
+  const h = await harness({
+    behavior: (spec) => async (ctl) => {
+      if (spec.role === 'reviewer') return { status: 'succeeded', structuredOutput: approve };
+      builds++;
+      if (builds === 1) {
+        // More patch text than the scan reads (32 MiB): unscanned commits must not go anywhere.
+        await commitFile(ctl, 'big/data.txt', `${'x'.repeat(99)}\n`.repeat(340_000), 'generated data');
+      } else {
+        const base = /git reset --soft ([0-9a-f]{12})/.exec(spec.prompt)![1];
+        await ctl.git(['rm', '-q', 'big/data.txt']);
+        await ctl.git(['reset', '--soft', base]);
+        await commitFile(ctl, 'big/README.md', 'generated at build time\n', 'document the data');
+      }
+      return { status: 'succeeded', structuredOutput: builderResult('completed') };
+    },
+  });
+  try {
+    const t = h.addTask('Data');
+    await h.sup.start();
+    await h.waitState(t.id, 'integrated');
+    assert.equal(builds, 2);
+    assert.ok(h.store.getTask(t.id)!.notes.some((n) => n.text.includes('the secret scan could not check all of its commits')));
+    assert.equal(h.readTarget('big/data.txt'), null);
+    assert.equal(h.readTarget('big/README.md'), 'generated at build time\n');
+    // A history git cannot read fails closed as well.
+    const sup = h.sup as any;
+    const unreadable = await sup.scanCommits(sup.runtimes.get('drill'), 'f'.repeat(40), h.store.getTask(t.id)!.headCommit);
+    assert.deepEqual(unreadable.secrets, []);
+    assert.match(unreadable.incomplete, /^git log failed: /);
   } finally {
     await h.cleanup();
   }

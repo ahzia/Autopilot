@@ -161,10 +161,20 @@ Within that model:
   pushes and merges in the private clone keep your environment because they may
   need your git credentials.
 * **Secrets.** Leftover files are auto-committed only if they do not look like
-  secrets (`.env*`, keys, credentials); every branch's net changes (its diff
-  against the base, up to 2 MB) are scanned for secret-looking values before it
-  is published and again before it merges. A secret added and removed again in
-  intermediate commits is not detected.
+  secrets (`.env*`, keys, credentials); the changes and the full message of
+  every commit on a branch (merge and root commits included) are scanned for
+  secret-looking values before it is published and again before it merges, so
+  a secret added and removed again in a later commit is still caught. A merge
+  commit's changes are the lines that none of its parents has. A branch whose
+  history cannot be scanned completely (more than 32 MiB of changes or of
+  commit messages, or a git error) is treated like one with a secret: it is
+  neither published nor merged. Files that git treats as binary (such as
+  images, archives or SQLite databases) are not scanned. The scan catches
+  accidental leaks, not a secret hidden on purpose: workers can write the
+  private clone's config and `info/attributes`, so a worker can make git treat
+  any file as binary, and a commit message can hide text from `git log` (after
+  a NUL byte, or behind its own `encoding` header). These are known
+  limitations.
 * **Approvals are bound to commits.** Inbox approvals, GitHub approvals and
   `/approve CODE` comments all apply to one exact revision; your "request
   changes" is recorded so that revision can never merge later.
@@ -218,4 +228,4 @@ runner against temporary repositories:
 | GitHub feedback (`github-feedback.test.ts`) | Trusted change request repairs once even if redelivered; untrusted comments ignored; a trusted GitHub approval of the exact head merges and supersedes the card; feedback after merge becomes a follow-up task; `/approve` needs the card's one-time code. |
 | Target branch tampering | A builder that moves `main` is caught; `main` restored; project paused with an urgent card; the work later merges only through the gate. |
 | Quota governor | After a usage warning, later builders start only when no other builder runs. |
-| Regressions (`regressions.test.ts`) | Policy edits need approval and update the runtime in place; a rejected revision never merges; cancelling one task keeps a shared card for the others; no cancel during a merge; secrets never published or merged; a replace ref cannot hide a change from the merge gate; reviewers and the planner get no git command that can write files; an answer arriving before the run ends resumes without a second card; a builder that switches branches keeps its work; after merging `main` into its branch, a task is judged only on its own changes. |
+| Regressions (`regressions.test.ts`) | Policy edits need approval and update the runtime in place; a rejected revision never merges; cancelling one task keeps a shared card for the others; no cancel during a merge; secrets never published or merged, even when a later commit removed them, they follow more than 2 MB of other changes or a branch reaches a `.env` file only by renaming another file, and a history too large to scan fails closed; a replace ref cannot hide a change from the merge gate; reviewers and the planner get no git command that can write files; an answer arriving before the run ends resumes without a second card; a builder that switches branches keeps its work; after merging `main` into its branch, a task is judged only on its own changes. |
