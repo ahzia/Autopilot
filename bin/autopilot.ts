@@ -99,13 +99,65 @@ function loadClaudeToken(home: Home): 'env' | 'file' | null {
 const expandHome = (p: string) => (p === '~' || p.startsWith('~/') ? join(process.env.HOME ?? '', p.slice(1)) : p);
 
 /**
+ * Split a --check or --setup command into the arguments it runs with, the way a POSIX
+ * shell splits words: 'single quotes' keep everything as written, "double quotes" keep
+ * everything except the escapes \\ \" \$ \`, and a backslash outside quotes keeps the
+ * next character (before a line break it joins the lines). Nothing is expanded. The
+ * command runs without a shell, so shell syntax outside quotes (| & ; < > backticks,
+ * $( and line breaks) is refused rather than passed on as arguments. Throws an Error
+ * that says what is wrong.
+ */
+export function parseShellWords(line: string): string[] {
+  const s = line.trim();
+  const words: string[] = [];
+  let word: string | null = null; // null between words; '' is an empty argument ('' or "")
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === ' ' || ch === '\t') {
+      if (word !== null) words.push(word);
+      word = null;
+    } else if (ch === "'") {
+      const end = s.indexOf("'", i + 1);
+      if (end < 0) throw new Error('a single quote is not closed');
+      word = (word ?? '') + s.slice(i + 1, end);
+      i = end;
+    } else if (ch === '"') {
+      word ??= '';
+      for (i++; s[i] !== '"'; i++) {
+        if (i >= s.length) throw new Error('a double quote is not closed');
+        if (s[i] === '\\' && s[i + 1] === '\n') i++;
+        else if (s[i] === '\\' && i + 1 < s.length && '\\"$`'.includes(s[i + 1])) word += s[++i];
+        else word += s[i];
+      }
+    } else if (ch === '\\') {
+      if (i + 1 >= s.length) throw new Error('it ends with a backslash, which escapes nothing');
+      if (s[++i] !== '\n') word = (word ?? '') + s[i];
+    } else if ('|&;<>`\n'.includes(ch) || (ch === '$' && s[i + 1] === '(')) {
+      const op = ch === '\n' ? 'a line break' : ch === '`' ? 'a backtick' : ch === '$' ? '$(' : /^[|&;<>]+/.exec(s.slice(i))![0];
+      throw new Error(`${op} is shell syntax, but the command runs without a shell: wrap it in sh -c '...', or leave the flag out and edit the command in config.json after init`);
+    } else {
+      word = (word ?? '') + ch;
+    }
+  }
+  if (word !== null) words.push(word);
+  return words;
+}
+
+/** A --setup value, or the command part of a --check value: its arguments (see parseShellWords). */
+export function parseCommandFlag(c: string): string[] {
+  const run = parseShellWords(c);
+  if (!run[0]) throw new Error('there is no command');
+  return run;
+}
+
+/**
  * `--check "test=npm test"` or `--check "npm test"`. Only a plain word before the first
  * '=' is a name, so commands that contain '=' themselves (node -e x=1) stay intact.
  */
 export function parseCheckFlag(c: string): { name: string; run: string[]; timeoutSeconds: number } {
-  const m = /^([A-Za-z0-9._:-]{1,40})=(.+)$/.exec(c.trim());
-  const cmd = (m ? m[2] : c).trim().split(/\s+/);
-  return { name: m ? m[1] : cmd[0], run: cmd, timeoutSeconds: 900 };
+  const m = /^([A-Za-z0-9._:-]{1,40})=(.+)$/s.exec(c.trim());
+  const run = parseCommandFlag(m ? m[2] : c);
+  return { name: m ? m[1] : run[0], run, timeoutSeconds: 900 };
 }
 
 /** True when nothing exists at `path` yet, or it is a folder with no entries at all. */
@@ -158,6 +210,16 @@ async function cmdInit(home: Home, args: string[]): Promise<void> {
   const path = home.configPath(id);
   if (existsSync(path) && !values.force) fail(`${path} exists (use --force to overwrite)`);
   const source = /^[a-z]+:\/\//.test(values.source) || values.source.startsWith('git@') ? values.source : resolve(expandHome(values.source));
+  // Parse the command flags first, so a mistake in one stops init before it creates anything.
+  const parseFlag = <T>(flag: string, value: string, parse: (v: string) => T): T => {
+    try {
+      return parse(value);
+    } catch (err) {
+      fail(`--${flag} ${JSON.stringify(value)}: ${(err as Error).message}`);
+    }
+  };
+  const checkFlags = values.check?.map((c) => parseFlag('check', c, parseCheckFlag));
+  const setupFlags = values.setup?.map((s) => parseFlag('setup', s, parseCommandFlag));
   if (values.create) {
     // Brand-new project: create a repository with one commit so worktrees have a base.
     if (/^[a-z]+:\/\//.test(source) || source.startsWith('git@')) fail('--create only works with a local path');
@@ -199,8 +261,8 @@ async function cmdInit(home: Home, args: string[]): Promise<void> {
       /* ignore */
     }
   }
-  if (values.check?.length) cfg.checks.commands = values.check.map(parseCheckFlag);
-  if (values.setup?.length) cfg.checks.setup = values.setup.map((s) => s.trim().split(/\s+/));
+  if (checkFlags?.length) cfg.checks.commands = checkFlags;
+  if (setupFlags?.length) cfg.checks.setup = setupFlags;
   let validated: ProjectConfig;
   try {
     validated = validateConfig(JSON.parse(JSON.stringify(cfg)), dirname(path));
@@ -209,9 +271,16 @@ async function cmdInit(home: Home, args: string[]): Promise<void> {
   }
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   writeFileSync(path, `${JSON.stringify({ $schema: 'autopilot-project-v1', ...validated }, null, 2)}\n`, { mode: 0o600 });
+  // Every setup step and check exactly as it will run: one JSON string per argument, no shell.
+  const argv = (a: string[]) => `[${a.map((x) => JSON.stringify(x)).join(', ')}]`;
+  const lines = (items: string[], none: string) => (items.length ? items.map((x) => `\n  ${x}`).join('') : ` ${none}`);
   process.stdout.write(`Created ${path}
 Profile: ${validated.profile} · forge: ${validated.repo.forge} · target: ${validated.repo.targetBranch}
-Checks: ${validated.checks.commands.map((c) => c.name).join(', ') || '(none — add some so merges are verified)'}
+Setup:${lines(validated.checks.setup.map(argv), '(none)')}
+Checks:${lines(
+    validated.checks.commands.map((c) => `${c.name}: ${argv(c.run)}`),
+    '(none — add some so merges are verified)',
+  )}
 Docs: ${validated.docs.length} file(s)
 
 Next:

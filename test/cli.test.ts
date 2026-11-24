@@ -109,6 +109,43 @@ test('init --create refuses a folder that is not empty and writes nothing', () =
   }
 });
 
+test('init parses quoted --check and --setup values, prints each argv and refuses shell syntax', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'ap-cli-'));
+  try {
+    const home = join(tmp, 'home');
+    const repo = join(tmp, 'repo');
+    const init = run([
+      'init', 'quoted', '--home', home, '--source', repo, '--create', '--runner', 'fake',
+      '--check', 'test=node -e "process.exit(1)"',
+      '--check', "lint=npx eslint 'src/**/*.ts'",
+      '--setup', "sh -c 'echo hi'",
+    ]);
+    assert.equal(init.status, 0, init.stderr);
+    const cfg = JSON.parse(readFileSync(join(home, 'projects', 'quoted', 'config.json'), 'utf8'));
+    assert.deepEqual(cfg.checks.commands.map((c: { name: string; run: string[] }) => [c.name, c.run]), [
+      ['test', ['node', '-e', 'process.exit(1)']],
+      ['lint', ['npx', 'eslint', 'src/**/*.ts']],
+    ]);
+    assert.deepEqual(cfg.checks.setup, [['sh', '-c', 'echo hi']]);
+    assert.match(init.stdout, /Setup:\n {2}\["sh", "-c", "echo hi"\]\n/);
+    assert.match(init.stdout, /Checks:\n {2}test: \["node", "-e", "process\.exit\(1\)"\]\n {2}lint: \["npx", "eslint", "src\/\*\*\/\*\.ts"\]\n/);
+
+    // Shell syntax is refused before anything is created.
+    const other = join(tmp, 'other');
+    const refused = run(['init', 'ops', '--home', home, '--source', other, '--create', '--check', 'test=npm test && npm run lint']);
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /--check "test=npm test && npm run lint": && is shell syntax, but the command runs without a shell: wrap it in sh -c '\.\.\.'/);
+    assert.equal(existsSync(other), false);
+    assert.equal(existsSync(join(home, 'projects', 'ops')), false);
+    const unclosed = run(['init', 'ops', '--home', home, '--source', other, '--setup', 'sh -c "echo hi']);
+    assert.equal(unclosed.status, 1);
+    assert.match(unclosed.stderr, /--setup "sh -c \\"echo hi": a double quote is not closed/);
+    assert.equal(existsSync(join(home, 'projects', 'ops')), false);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('an invalid config is reported, never silently used', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'ap-cli-'));
   try {

@@ -41,9 +41,17 @@ If `--source` is a local folder with a `package.json`, `init` adds a check for
 each of the `typecheck`, `lint` and `test` scripts that exist
 (`npm run <script>`) and a setup step: `npm ci` when there is a
 `package-lock.json`, otherwise `npm install`. `--check` and `--setup` replace
-these. Both flags split the command on spaces, without shell quoting; for
-quotes, pipes or `&&`, edit the file and use `["sh", "-c", "..."]`. After
-`init` you edit the file by hand. The autopilot never writes it again.
+these. Both flags split the command into arguments the way a shell does:
+`'single quotes'` keep everything as written, `"double quotes"` keep
+everything except the escapes `\\`, `\"`, `\$` and `` \` ``, and a backslash
+outside quotes keeps the next character. `init` expands nothing itself:
+variables, `~` and globs such as `*.ts` reach the command as written. The
+command runs without a shell, so `init` refuses `|`, `&`, `;`, `<`, `>`,
+backticks, `$(` and line breaks outside quotes. For those, wrap the command in
+`sh -c '...'`, for example `--check "test=sh -c 'npm test && npm run lint'"`,
+or edit the file and use `["sh", "-c", "..."]`. `init` prints every setup step
+and check as the list of arguments it will run. After `init` you edit the file
+by hand. The autopilot never writes it again.
 
 ## General rules
 
