@@ -44,8 +44,16 @@ git clone https://github.com/ahzia/StayOn-Autopilot.git && cd StayOn-Autopilot &
 ```
 
 The command is `./bin/autopilot.ts` in the repository folder. To call it as
-`autopilot` from anywhere, add an alias (run this in the repository folder, and
-put the same line with the absolute path into your shell profile):
+`autopilot` from anywhere, run this in the repository folder. It links the
+command into npm's global folder and so puts `autopilot` on your `PATH`:
+
+```bash
+npm link
+```
+
+npm needs permission to write to its global folder. If it reports a permission
+error, add an alias instead (run this in the repository folder, and put the same
+line with the absolute path into your shell profile):
 
 ```bash
 alias autopilot="$PWD/bin/autopilot.ts"
@@ -128,10 +136,10 @@ In a terminal (stops when you close it):
 autopilot run
 ```
 
-On macOS, `caffeinate -is ./bin/autopilot.ts run` (in the repository folder;
-`caffeinate` cannot run a shell alias) also keeps the Mac awake while the
-autopilot works. Ctrl-C stops the workers; their Claude sessions are kept and
-resumed on the next run.
+On macOS, `caffeinate -is ./bin/autopilot.ts run` (in the repository folder,
+or `caffeinate -is autopilot run` after `npm link`; `caffeinate` cannot run a
+shell alias) also keeps the Mac awake while the autopilot works. Ctrl-C stops
+the workers; their Claude sessions are kept and resumed on the next run.
 
 Or, on macOS, as a background service that starts at login and restarts after a
 crash (a LaunchAgent; it also keeps the Mac awake while it runs):
@@ -261,8 +269,9 @@ except the optional `repo.pushIntegratedTo` branch pushed to your repository.
 * Start over completely: stop the autopilot (and `autopilot service uninstall`
   on macOS), then delete `~/.stayon-autopilot`. This also deletes the token
   file and invalidates paired phones.
-* Remove the `autopilot` command: delete the alias from your shell profile and
-  the repository folder.
+* Remove the `autopilot` command: run `npm uninstall -g stayon-autopilot` if
+  you used `npm link` (or delete the alias from your shell profile), then
+  delete the repository folder.
 
 **Updating:** run `git pull && npm install` in the repository folder, then
 restart the autopilot. Configs, history and paired phones are kept; the database

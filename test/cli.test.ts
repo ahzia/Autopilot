@@ -2,9 +2,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 
 const CLI = resolve(import.meta.dirname, '..', 'bin', 'autopilot.ts');
 const run = (args: string[], env: NodeJS.ProcessEnv = {}) =>
@@ -88,4 +88,41 @@ test('help and unknown commands', () => {
   const bad = run(['frobnicate']);
   assert.equal(bad.status, 1);
   assert.match(bad.stderr, /unknown command/);
+});
+
+test('the CLI runs when it is started through symlinks, as npm link installs it', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'ap-cli-'));
+  // npm link makes <prefix>/lib/node_modules/<package> point at the repository and
+  // <prefix>/bin/autopilot point at bin/autopilot.ts inside that link.
+  const pkgLink = join(tmp, 'lib', 'node_modules', 'stayon-autopilot');
+  try {
+    mkdirSync(dirname(pkgLink), { recursive: true });
+    symlinkSync(resolve(import.meta.dirname, '..'), pkgLink, 'dir');
+    mkdirSync(join(tmp, 'bin'));
+    symlinkSync(join('..', 'lib', 'node_modules', 'stayon-autopilot', 'bin', 'autopilot.ts'), join(tmp, 'bin', 'autopilot'));
+    const env = {
+      ...process.env,
+      PATH: [join(tmp, 'bin'), dirname(process.execPath), process.env.PATH ?? ''].join(delimiter),
+      AUTOPILOT_HOME: join(tmp, 'home'),
+    };
+    // Found on the PATH and started through its #! line, like a user typing `autopilot`.
+    const help = spawnSync('autopilot', ['--help'], { encoding: 'utf8', env });
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(help.stdout, /Usage: autopilot <command>/);
+    const status = spawnSync('autopilot', ['status'], { encoding: 'utf8', env });
+    assert.equal(status.status, 0, status.stderr);
+    assert.match(status.stdout, /No projects yet/);
+    assert.ok(existsSync(join(tmp, 'home', 'autopilot.db')));
+    // node <symlink> as well.
+    const viaNode = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', join(tmp, 'bin', 'autopilot'), 'help'], { encoding: 'utf8', env });
+    assert.match(viaNode.stdout, /Usage: autopilot <command>/);
+  } finally {
+    // Remove the link to the repository first: unlink never follows it.
+    try {
+      unlinkSync(pkgLink);
+    } catch {
+      /* not created */
+    }
+    rmSync(tmp, { recursive: true, force: true });
+  }
 });

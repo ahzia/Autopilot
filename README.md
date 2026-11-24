@@ -80,8 +80,15 @@ time, ask you two questions (one of them pauses its task until you answer),
 auto-merge routine work and send a sensitive change to you as a review card.
 Answer the cards and watch the tasks resume. Stop with Ctrl-C.
 
-To type `autopilot` instead of `./bin/autopilot.ts`, add an alias from the
-repository folder (and to your shell profile, with the absolute path):
+To type `autopilot` instead of `./bin/autopilot.ts`, run this in the
+repository folder. It puts `autopilot` on your `PATH`:
+
+```bash
+npm link
+```
+
+If npm reports a permission error for its global folder, add an alias instead,
+from the repository folder (and to your shell profile, with the absolute path):
 
 ```bash
 alias autopilot="$PWD/bin/autopilot.ts"

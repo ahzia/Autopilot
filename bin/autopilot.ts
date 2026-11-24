@@ -3,7 +3,7 @@
 // StayOn Autopilot command line.
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -649,7 +649,24 @@ async function main(): Promise<void> {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+/**
+ * True when `entry` (process.argv[1]) is this file, i.e. the CLI was launched as
+ * the program rather than imported. Both sides go through realpath, as in
+ * src/mcp/server.ts: `npm link` starts the CLI through a symlink, and Node loads
+ * the module from its real path, so the plain paths differ. If realpath fails,
+ * the plain paths are compared.
+ */
+export function isEntryPoint(entry: string | undefined, moduleUrl: string): boolean {
+  if (!entry) return false;
+  const self = fileURLToPath(moduleUrl);
+  try {
+    return realpathSync(entry) === realpathSync(self);
+  } catch {
+    return resolve(entry) === self;
+  }
+}
+
+if (isEntryPoint(process.argv[1], import.meta.url)) {
   try {
     chmodSync(fileURLToPath(import.meta.url), 0o755);
   } catch {
