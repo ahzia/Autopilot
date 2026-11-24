@@ -163,6 +163,14 @@ it the token file rather than an exported token.
 On Linux, run `autopilot run` under a service manager of your choice, for
 example a systemd user service; `autopilot service` is macOS-only.
 
+Only one `autopilot run` can use a home directory at a time, because a second
+one would stop the first one's workers. A second `autopilot run` on the same
+home, for example in a terminal while the background service runs, stops at
+once with a message that names the running one's process id. To run in a
+terminal instead, first stop the service with `autopilot service uninstall`.
+While it runs, the autopilot keeps its process id in `supervisor.lock` in the
+home directory; a lock left behind by a crash is replaced at the next start.
+
 ## 6. Use it from your phone
 
 1. Install Tailscale on the computer and on your phone and sign both into the

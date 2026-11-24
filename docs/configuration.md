@@ -350,6 +350,7 @@ error naming the setting.
 | (the home folder itself) | everything below | the CLI, mode 0700 | A folder that already exists keeps its mode. Keep it 0700: the files inside rely on it. |
 | `autopilot.db` (and `-wal`, `-shm`) | SQLite database: projects and their last approved configs, policy history, tasks, runs, cards, events, inbox sessions and the Web Push key pair | the CLI | Default file mode. Secret: it holds the Web Push private key in plain text and copies of your configs (including any ntfy topic). Session tokens, pairing codes and run tokens are stored only as SHA-256 hashes. |
 | `server.json` | inbox server settings | you (optional) | Not secret. |
+| `supervisor.lock` | the process id, start time, launch path and boot id of the `autopilot run` that uses this home | `autopilot run`, which removes it when it stops | Not secret. While its process runs, another `autopilot run` on this home stops with a message. A lock from before the computer last started is replaced, and so is one whose process is gone or whose process id now belongs to a process that started later (as far as `ps` can tell). |
 | `claude-oauth-token` | a long-lived Claude Code token from `claude setup-token` | you (optional) | Secret. Run `chmod 600` on it; the CLI warns if others can read it, but still uses it. |
 | `projects/<id>/config.json` | the project's policy | `autopilot init`, mode 0600 | Contains your ntfy topic if you set one. |
 | `projects/<id>/repo.git/` | the private bare clone of `repo.source` | the supervisor | Default modes. |

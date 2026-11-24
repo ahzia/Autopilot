@@ -352,8 +352,142 @@ async function cmdDoctor(home: Home): Promise<void> {
   else check('Phone access', null, 'install Tailscale (or use the same Wi-Fi with --host 0.0.0.0) to reach the inbox from your phone');
 }
 
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * When process `pid` started, in seconds after process 1 (launchd or init) started, as `ps`
+ * tells; null if it cannot. The value stays the same while the process runs, also when the
+ * clock is set: that moves both start times alike, if at all.
+ */
+function startedAfterInit(pid: number): number | null {
+  // A fixed date format and time zone, and one -o per column: procps takes everything after
+  // a column's "=" for its header.
+  const ps = spawnSync('ps', ['-o', 'pid=', '-o', 'lstart=', '-p', `1,${pid}`], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', TZ: 'UTC0' } });
+  if (ps.error || ps.status !== 0) return null;
+  const started = new Map<number, number>();
+  for (const line of ps.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+\w{3} (\w{3}) +(\d{1,2}) (\d\d):(\d\d):(\d\d) (\d{4})\s*$/.exec(line); // "    1 Mon Nov  9 09:19:58 2026"
+    const month = MONTHS.indexOf(m?.[2] ?? '');
+    if (m && month >= 0) started.set(Number(m[1]), Date.UTC(Number(m[7]), month, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6])) / 1000);
+  }
+  const init = started.get(1);
+  const own = started.get(pid);
+  return init === undefined || own === undefined ? null : own - init;
+}
+
+/** The id of the current boot (Linux boot_id, macOS kern.bootsessionuuid), or null if there is none to read. */
+function bootId(): string | null {
+  if (process.platform === 'darwin') {
+    const r = spawnSync('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'], { encoding: 'utf8' });
+    return r.error || r.status !== 0 ? null : r.stdout.trim() || null;
+  }
+  try {
+    return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** What <home>/supervisor.lock tells about the run that wrote it. */
+interface HomeLock {
+  pid: number;
+  /** Its process.argv[1]: the path it was started by, which Node makes absolute (links are not resolved). */
+  entry?: unknown;
+  /** Its startedAfterInit(), or null if ps could not tell. */
+  startedAfterInit?: unknown;
+  /** Its bootId(), or null if there was none to read. */
+  bootId?: unknown;
+}
+
+/**
+ * Whether the `autopilot run` that wrote `lock` still runs. Not if the lock and `thisBoot` name
+ * different boots: no process outlives a boot. Otherwise its pid must be alive and still belong
+ * to it. When the lock and ps both tell when the pid's process started, the two must agree: in
+ * the same boot, a process that got the pid after the run ended started later. Otherwise its
+ * command line must say autopilot or contain the path the run was started by (all that a link
+ * with another name shows). Without a usable `ps`, any live pid counts.
+ */
+function lockHolderRuns(lock: HomeLock, thisBoot: string | null): boolean {
+  if (typeof lock.bootId === 'string' && thisBoot !== null && lock.bootId !== thisBoot) return false;
+  const alive = () => {
+    try {
+      process.kill(lock.pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'EPERM'; // alive, but not ours to signal
+    }
+  };
+  if (!alive()) return false;
+  if (typeof lock.startedAfterInit === 'number') {
+    const started = startedAfterInit(lock.pid);
+    if (started !== null) return Math.abs(started - lock.startedAfterInit) <= 2; // ps tells whole seconds
+  }
+  const ps = spawnSync('ps', ['-o', 'command=', '-p', String(lock.pid)], { encoding: 'utf8' });
+  if (ps.error || ps.status !== 0) return alive();
+  return ps.stdout.includes('autopilot') || (typeof lock.entry === 'string' && lock.entry !== '' && ps.stdout.includes(lock.entry));
+}
+
+/**
+ * One `autopilot run` per home: a second one would take the first one's runs for
+ * leftovers of a crash and kill its workers. Creates <home>/supervisor.lock (pid, start
+ * time, launch path and boot id), replaces a lock whose run is gone, and removes the lock
+ * when this process exits. Exits with a message while another run holds it.
+ */
+function lockHome(home: Home): void {
+  const lockPath = join(home.root, 'supervisor.lock');
+  const readLock = (raw: string): HomeLock | null => {
+    try {
+      const lock = JSON.parse(raw);
+      return Number.isInteger(lock?.pid) && lock.pid > 0 ? lock : null;
+    } catch {
+      return null;
+    }
+  };
+  const boot = bootId();
+  const own = `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), entry: process.argv[1], startedAfterInit: startedAfterInit(process.pid), bootId: boot })}\n`;
+  mkdirSync(home.root, { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      writeFileSync(lockPath, own, { flag: 'wx', mode: 0o600 });
+      process.on('exit', () => {
+        try {
+          if (readLock(readFileSync(lockPath, 'utf8'))?.pid === process.pid) rmSync(lockPath, { force: true });
+        } catch {
+          /* already gone */
+        }
+      });
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    let raw: string;
+    try {
+      raw = readFileSync(lockPath, 'utf8');
+    } catch {
+      continue; // removed in the meantime
+    }
+    const lock = readLock(raw);
+    if (lock === null && attempt < 2) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); // another run may be writing it right now
+      continue;
+    }
+    if (lock !== null && lock.pid !== process.pid && lockHolderRuns(lock, boot)) {
+      fail(`another autopilot run is using ${home.root} (pid ${lock.pid}); stop it first, or delete ${lockPath} if it is stale`);
+    }
+    // Stale: its run is gone. Replace it, unless another run did so in the meantime.
+    try {
+      if (readFileSync(lockPath, 'utf8') === raw) rmSync(lockPath, { force: true });
+    } catch {
+      /* already gone */
+    }
+  }
+  fail(`could not create ${lockPath}; delete it if no autopilot run is using ${home.root}`);
+}
+
 async function cmdRun(home: Home, args: string[]): Promise<void> {
   const { values } = parseArgs({ args, options: { port: { type: 'string' }, host: { type: 'string' }, 'accept-config': { type: 'boolean' } } });
+  // Before anything touches the state: a second run would kill this home's running workers.
+  lockHome(home);
   const settings = readServerSettings(home);
   const host = values.host ?? settings.host;
   const port = values.port ? Number(values.port) : settings.port;
@@ -414,14 +548,8 @@ async function cmdRun(home: Home, args: string[]): Promise<void> {
   });
   await supervisor.start();
 
-  const base = settings.publicUrl ?? `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${http.port}`;
-  const code = createPairingCode(store);
-  process.stdout.write(`StayOn Autopilot running.
-  Inbox:        ${base}
-  Pair a phone: ${base}/#code=${code}   (valid 10 minutes, single use; \`autopilot pair\` makes a new one)
-  Projects:     ${store.listProjects().map((p) => `${p.id}${p.paused ? ' (paused)' : ''}`).join(', ') || 'none — run autopilot init'}
-Press Ctrl-C to stop (running workers are stopped; their sessions can be resumed).
-`);
+  // Handle Ctrl-C and SIGTERM before saying so: a signal that arrives first would end the
+  // process without stopping its workers or removing the lock.
   let stopping = false;
   const shutdown = async (sig: string) => {
     if (stopping) process.exit(1);
@@ -434,6 +562,15 @@ Press Ctrl-C to stop (running workers are stopped; their sessions can be resumed
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
+
+  const base = settings.publicUrl ?? `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${http.port}`;
+  const code = createPairingCode(store);
+  process.stdout.write(`StayOn Autopilot running.
+  Inbox:        ${base}
+  Pair a phone: ${base}/#code=${code}   (valid 10 minutes, single use; \`autopilot pair\` makes a new one)
+  Projects:     ${store.listProjects().map((p) => `${p.id}${p.paused ? ' (paused)' : ''}`).join(', ') || 'none — run autopilot init'}
+Press Ctrl-C to stop (running workers are stopped; their sessions can be resumed).
+`);
 }
 
 const SERVICE_LABEL = 'com.stayon.autopilot';
