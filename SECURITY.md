@@ -43,7 +43,9 @@ What the project commits to:
 
 - The inbox listens on `127.0.0.1` unless you configure otherwise, needs a
   session from a single-use pairing link, and requires a CSRF header for every
-  write.
+  write. `autopilot run` warns when it serves the inbox over plain HTTP on a
+  non-loopback address, unless `publicUrl` is an `https://` address; use
+  Tailscale Serve (HTTPS) to reach it from your phone.
 - Worker environments have API-key variables removed, so runs use your Claude
   subscription and never fall back to paid API billing.
 - Builders are denied the tools to push, merge or approve; only the supervisor

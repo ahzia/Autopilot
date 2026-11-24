@@ -206,7 +206,7 @@ the real service.
 
 | Area | Status |
 | --- | --- |
-| Supervisor loop, task store, leases, merge policy, local git mode | **Stable** — unit tests plus 29 end-to-end failure drills (crashes, restarts, stale answers, conflicts, red builds after merge, usage limits, auth loss, branch tampering, secrets, policy edits) |
+| Supervisor loop, task store, leases, merge policy, local git mode | **Stable** — unit tests plus 77 end-to-end failure drills (crashes, restarts, stale answers, conflicts, red builds after merge, usage limits, auth loss, branch tampering, secrets, policy edits) |
 | Configuration file (`version: 1`) | **Stable** — strict validation; breaking changes will bump the version |
 | CLI (`init`, `run`, `doctor`, `status`, `task`, `decisions`, `answer`, `pause`, `resume`, `logs`, `pair`) | **Stable** |
 | Demo mode and the phone inbox | **Stable** in demo mode |
