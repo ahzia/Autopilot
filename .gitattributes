@@ -1,0 +1,5 @@
+# Normalize line endings; the tests compare text and the sources run unbuilt.
+* text=auto eol=lf
+*.svg text eol=lf
+*.png binary
+*.ico binary

@@ -1,0 +1,45 @@
+{
+  "name": "stayon-autopilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local supervisor that runs parallel Claude Code workers on a git repository and asks you only for real decisions, through a phone-friendly card inbox.",
+  "keywords": [
+    "claude-code",
+    "ai-agents",
+    "autopilot",
+    "orchestration",
+    "git-worktrees",
+    "code-review",
+    "merge-policy",
+    "pwa",
+    "web-push"
+  ],
+  "homepage": "https://github.com/ahzia/StayOn-Autopilot#readme",
+  "bugs": {
+    "url": "https://github.com/ahzia/StayOn-Autopilot/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ahzia/StayOn-Autopilot.git"
+  },
+  "license": "MIT",
+  "author": "ahzia and StayOn contributors",
+  "bin": {
+    "autopilot": "bin/autopilot.ts"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning bin/autopilot.ts run",
+    "test": "node --disable-warning=ExperimentalWarning --test --test-concurrency=4 \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p . --noEmit",
+    "check": "npm run typecheck && npm test",
+    "smoke": "node --disable-warning=ExperimentalWarning scripts/live-smoke.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

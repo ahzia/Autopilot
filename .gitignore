@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build and coverage output (the project runs from source; nothing is built)
+dist/
+build/
+coverage/
+*.tgz
+
+# Local autopilot state, databases and logs (never commit these)
+.autopilot-home/
+.stayon-autopilot/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+logs/
+npm-debug.log*
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+claude-oauth-token
+
+# Local tool and editor settings
+.claude/
+CLAUDE.local.md
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
