@@ -342,6 +342,11 @@ error naming the setting.
   that network; phones still need a pairing link to sign in. With a LAN
   address, the server also listens on `127.0.0.1`, because workers reach the
   autopilot through a bridge that only accepts local connections.
+* The inbox server itself speaks plain HTTP. On a network address, anyone who
+  can watch that network can read the pairing code and the session cookie, so
+  `autopilot run` prints a warning for any address other than a loopback one
+  unless `publicUrl` starts with `https://`. For phone access, use Tailscale
+  Serve as described in [setup.md](setup.md#6-use-it-from-your-phone).
 
 ## Home directory layout
 

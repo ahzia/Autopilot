@@ -15,6 +15,7 @@ import type { Decision, SupervisorActions, TaskState } from '../src/types.ts';
 import { randomToken } from '../src/util.ts';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const SETUP_GUIDE = join(ROOT, 'docs', 'setup.md');
 
 const HELP = `StayOn Autopilot — parallel Claude Code workers with a phone decision inbox.
 
@@ -349,7 +350,23 @@ async function cmdDoctor(home: Home): Promise<void> {
   }
   const ts = spawnSync('tailscale', ['status', '--json'], { encoding: 'utf8' });
   if (ts.status === 0) check('Phone access', null, `Tailscale found: run \`tailscale serve --bg ${settings.port}\` and set publicUrl in ${home.serverConfigPath}`);
-  else check('Phone access', null, 'install Tailscale (or use the same Wi-Fi with --host 0.0.0.0) to reach the inbox from your phone');
+  else
+    check(
+      'Phone access',
+      null,
+      `install Tailscale and use Tailscale Serve (HTTPS, only inside your tailnet) to reach the inbox from your phone: see ${SETUP_GUIDE}, section 6. Avoid --host 0.0.0.0: it serves the inbox as plain HTTP to everyone on your network.`,
+    );
+}
+
+/**
+ * The warning `run` prints when the inbox is served over plain HTTP on a network
+ * address: bound to anything but loopback, with no https publicUrl (Tailscale Serve)
+ * in front of it. Null when there is nothing to warn about.
+ */
+export function plainHttpWarning(address: string, port: number, publicUrl: string | null): string | null {
+  if (address === '::1' || /^(::ffff:)?127\.\d+\.\d+\.\d+$/.test(address) || /^https:\/\//i.test(publicUrl ?? '')) return null;
+  const where = address.includes(':') ? `[${address}]:${port}` : `${address}:${port}`;
+  return `the inbox is served over plain HTTP on ${where}. Anyone who can watch that network can read the sign-in traffic (the pairing code and the 30-day session cookie) and use the inbox as you: answer cards, approve merges, add tasks. For phone access, use Tailscale Serve with an https publicUrl instead: see ${SETUP_GUIDE}, section 6.`;
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -563,6 +580,9 @@ async function cmdRun(home: Home, args: string[]): Promise<void> {
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
+  // Judged by the address actually bound, so `localhost` counts as loopback and `0.0.0.0` does not.
+  const warning = plainHttpWarning((http.server.address() as { address: string }).address, http.port, settings.publicUrl);
+  if (warning) process.stderr.write(`autopilot: warning: ${warning}\n`);
   const base = settings.publicUrl ?? `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${http.port}`;
   const code = createPairingCode(store);
   process.stdout.write(`StayOn Autopilot running.

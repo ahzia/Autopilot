@@ -195,9 +195,12 @@ home directory; a lock left behind by a crash is replaced at the next start.
 
 Use Tailscale Serve rather than `--host 0.0.0.0`: serving the inbox on your
 local network is plain HTTP, so anyone who can watch that network can capture
-the pairing link and the session cookie. A paired phone stays signed in for 30
-days; there is no command yet to sign out a lost phone, so if that happens,
-stop the autopilot and start over (section 9).
+the pairing link and the session cookie. `autopilot run` prints a warning when
+it serves the inbox on any address other than `127.0.0.1` (or another loopback
+address) and `publicUrl` is not an `https://` address; it still starts. A
+paired phone stays signed in for 30 days; there is no command yet to sign out
+a lost phone, so if that happens, stop the autopilot and start over
+(section 9).
 
 Optional extra pager: set `inbox.ntfyUrl` / `inbox.ntfyTopic` in a project
 config to also notify through ntfy. Notifications never contain the question

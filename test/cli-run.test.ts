@@ -5,6 +5,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { plainHttpWarning } from '../bin/autopilot.ts';
 
 const CLI = resolve(import.meta.dirname, '..', 'bin', 'autopilot.ts');
 
@@ -86,6 +87,8 @@ test('a second autopilot run on the same home stops at once and leaves the first
     // A normal stop removes the lock.
     assert.equal(await stop(first), 0, first.stderr());
     assert.equal(existsSync(lock), false);
+    // Served on 127.0.0.1 only: no plain-HTTP warning.
+    assert.doesNotMatch(first.stderr(), /plain HTTP/);
   } finally {
     await Promise.all(runs.map(stop));
     rmSync(tmp, { recursive: true, force: true });
@@ -278,5 +281,24 @@ test('a lock whose process is gone or is not an autopilot run is replaced', asyn
     other.kill();
     await Promise.all(runs.map(stop));
     rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('run warns about plain HTTP only on a network address without an https publicUrl', () => {
+  for (const address of ['127.0.0.1', '127.0.0.53', '::1', '::ffff:127.0.0.1']) assert.equal(plainHttpWarning(address, 4777, null), null, address);
+  for (const url of ['https://box.example.ts.net', 'HTTPS://box.example.ts.net']) assert.equal(plainHttpWarning('0.0.0.0', 4777, url), null, url);
+  const exposed: [string, string][] = [
+    ['0.0.0.0', '0.0.0.0:4777'],
+    ['::', '[::]:4777'],
+    ['192.168.1.20', '192.168.1.20:4777'],
+    ['fe80::1', '[fe80::1]:4777'],
+  ];
+  for (const [address, where] of exposed) {
+    for (const url of [null, 'http://192.168.1.20:4777']) {
+      const warning = plainHttpWarning(address, 4777, url) ?? '';
+      assert.ok(warning.startsWith(`the inbox is served over plain HTTP on ${where}.`), `${address} ${url}: ${warning}`);
+      assert.match(warning, /can read the sign-in traffic \(the pairing code and the 30-day session cookie\) and use the inbox as you/);
+      assert.match(warning, /use Tailscale Serve with an https publicUrl instead: see \/.*docs\/setup\.md, section 6\.$/);
+    }
   }
 });

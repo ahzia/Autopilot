@@ -164,6 +164,26 @@ test('an invalid config is reported, never silently used', () => {
   }
 });
 
+test('doctor recommends Tailscale Serve for phone access, not a plain-HTTP bind on the Wi-Fi', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'ap-cli-'));
+  try {
+    // Only git on the PATH, so tailscale is missing and doctor gives its install hint.
+    const bin = join(tmp, 'bin');
+    mkdirSync(bin);
+    const git = (process.env.PATH ?? '').split(delimiter).map((d) => join(d, 'git')).find((p) => existsSync(p));
+    assert.ok(git, 'git is on the PATH');
+    symlinkSync(git, join(bin, 'git'));
+    const doctor = run(['doctor', '--home', join(tmp, 'home')], { PATH: bin });
+    assert.equal(doctor.status, 0, doctor.stderr);
+    const hint = doctor.stdout.split('\n').find((l) => l.includes('Phone access')) ?? '';
+    assert.match(hint, /^• Phone access — install Tailscale and use Tailscale Serve \(HTTPS, only inside your tailnet\) to reach the inbox from your phone: see \/.*docs\/setup\.md, section 6\./);
+    assert.match(hint, /Avoid --host 0\.0\.0\.0: it serves the inbox as plain HTTP to everyone on your network\.$/);
+    assert.doesNotMatch(hint, /same Wi-Fi/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('help and unknown commands', () => {
   assert.match(run(['help']).stdout, /Usage: autopilot <command>/);
   const bad = run(['frobnicate']);
