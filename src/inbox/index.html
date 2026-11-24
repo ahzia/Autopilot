@@ -1,0 +1,136 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#101317" media="(prefers-color-scheme: dark)">
+  <meta name="referrer" content="no-referrer">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Autopilot">
+  <meta name="description" content="Decision cards from your Autopilot workers.">
+  <title>Autopilot</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <h1 class="brand"><img src="/icon.svg" alt="" width="28" height="28"><span>Autopilot</span></h1>
+      <div class="topbar-controls" id="topbar-controls" hidden>
+        <label class="visually-hidden" for="project-filter">Project</label>
+        <select id="project-filter" class="project-filter">
+          <option value="">All projects</option>
+        </select>
+        <span class="badge" id="pending-badge" title="Pending decisions">
+          <span class="visually-hidden">Pending decisions: </span><span id="pending-count">0</span>
+        </span>
+      </div>
+    </div>
+    <p class="offline-banner" id="offline-banner" role="status" hidden>Offline. Showing what was last loaded; retrying.</p>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <section class="screen" id="screen-loading" aria-label="Loading">
+      <p class="muted center">Loading…</p>
+    </section>
+
+    <section class="screen" id="screen-pair" aria-labelledby="pair-title" hidden>
+      <div class="pair panel">
+        <img class="pair-icon" src="/icon.svg" alt="" width="64" height="64">
+        <h2 id="pair-title">Connect this phone</h2>
+        <p>Run <code>autopilot pair</code> on your computer and open the link.</p>
+        <p class="muted">The link works once and expires after a few minutes. This phone then stays signed in for 30 days.</p>
+        <p class="form-error" id="pair-error" role="alert" hidden></p>
+        <form class="form" id="pair-form" novalidate>
+          <label for="pair-code">Or paste the link or code here</label>
+          <input id="pair-code" name="code" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+          <button type="submit" class="btn btn-primary">Connect</button>
+        </form>
+      </div>
+    </section>
+
+    <section class="screen" id="screen-inbox" aria-labelledby="inbox-title" hidden>
+      <h2 class="visually-hidden" id="inbox-title">Inbox</h2>
+      <div class="stack" id="inbox-body"></div>
+    </section>
+
+    <section class="screen" id="screen-digest" aria-labelledby="digest-title" hidden>
+      <div class="screen-head">
+        <h2 id="digest-title">Last 24 hours</h2>
+        <button type="button" class="btn btn-small btn-quiet" id="digest-refresh">Refresh</button>
+      </div>
+      <div id="digest-body"></div>
+    </section>
+
+    <section class="screen" id="screen-board" aria-labelledby="board-title" hidden>
+      <div class="screen-head">
+        <h2 id="board-title">Board</h2>
+        <button type="button" class="btn btn-small btn-quiet" id="board-refresh">Refresh</button>
+      </div>
+      <details class="panel add-task" id="add-task">
+        <summary>Add a task</summary>
+        <form class="form" id="add-task-form" novalidate>
+          <label for="task-project">Project</label>
+          <select id="task-project" required></select>
+          <label for="task-title">Title</label>
+          <input id="task-title" type="text" maxlength="200" required>
+          <label for="task-objective">Objective</label>
+          <textarea id="task-objective" rows="4" maxlength="8000" required></textarea>
+          <label for="task-criteria">Acceptance criteria <span class="muted">(one per line, optional)</span></label>
+          <textarea id="task-criteria" rows="3"></textarea>
+          <p class="form-error" id="task-form-error" role="alert" hidden></p>
+          <button type="submit" class="btn btn-primary">Add task</button>
+        </form>
+      </details>
+      <div id="board-body"></div>
+    </section>
+
+    <section class="screen" id="screen-status" aria-labelledby="status-title" hidden>
+      <div class="screen-head">
+        <h2 id="status-title">Status</h2>
+      </div>
+      <div id="status-body"></div>
+    </section>
+  </main>
+
+  <nav class="tabbar" id="tabbar" aria-label="Sections" hidden>
+    <button type="button" class="tab" data-tab="inbox" aria-current="page">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h4.5l1.5 3h4l1.5-3H20M6.2 5h11.6L20 13v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Inbox</span>
+      <span class="tab-badge" id="tab-badge" hidden>0</span>
+    </button>
+    <button type="button" class="tab" data-tab="digest">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zM8.5 8.5h7M8.5 12h7M8.5 15.5h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Digest</span>
+    </button>
+    <button type="button" class="tab" data-tab="board">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 4.5h4v15h-4zM10 4.5h4v10h-4zM15.5 4.5h4v12.5h-4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+      <span>Board</span>
+    </button>
+    <button type="button" class="tab" data-tab="status">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2.5-6 5 12 2.5-6h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Status</span>
+    </button>
+  </nav>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <dialog class="sheet" id="sheet" aria-labelledby="sheet-title">
+    <div class="sheet-head">
+      <h2 id="sheet-title">Task</h2>
+      <button type="button" class="btn btn-small btn-quiet" id="sheet-close">Close</button>
+    </div>
+    <div class="sheet-body" id="sheet-body"></div>
+  </dialog>
+
+  <noscript><p class="panel">Autopilot Inbox needs JavaScript.</p></noscript>
+</body>
+</html>

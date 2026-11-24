@@ -1,0 +1,19 @@
+{
+  "name": "Autopilot Inbox",
+  "short_name": "Autopilot",
+  "description": "Decision cards from your Autopilot workers.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4f5f7",
+  "theme_color": "#2456d3",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
