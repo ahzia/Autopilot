@@ -1,0 +1,80 @@
+{
+  "$schema": "autopilot-project-v1",
+  "version": 1,
+  "id": "example-app",
+  "name": "Example App",
+  "profile": "balanced_autopilot",
+  "repo": {
+    "source": "/path/to/your-app",
+    "targetBranch": "main",
+    "branchPrefix": "autopilot/",
+    "forge": "local",
+    "github": null,
+    "pushIntegratedTo": "autopilot/main"
+  },
+  "docs": [
+    "/path/to/your-app/docs/product.md",
+    "/path/to/your-app/docs/architecture.md"
+  ],
+  "charter": "Example App is a web application run as an open laboratory. Build the core user journey described in product.md on the architecture in architecture.md, then keep improving it. You may research comparable products, invent, combine, simplify and retire features without asking the founder for each idea; record a hypothesis for every experiment and keep experiments reversible (feature flags or isolated entry points). Keep the known-good core journey working, tested and documented. Use synthetic data and local or preview environments only: no public release, spending, new collection of personal or sensitive data, production credentials or destructive data changes without an explicit founder decision card. Write original code and content; learn patterns from other products but never copy their assets, branding or code. Accessibility and privacy are requirements, not extras.",
+  "execution": {
+    "runner": "claude-cli",
+    "claudeBin": "claude",
+    "model": "opus",
+    "plannerModel": null,
+    "reviewerModel": null,
+    "effort": null,
+    "permissionMode": "auto",
+    "sandbox": false,
+    "settingSources": ["user"],
+    "allowedTools": [],
+    "disallowedTools": ["Bash(git push:*)", "Bash(git push)", "Bash(gh pr merge:*)", "Bash(gh pr review:*)", "Bash(gh repo delete:*)", "Bash(rm -rf /:*)"],
+    "maxBuilders": 2,
+    "maxReviewers": 1,
+    "maxTurns": 150,
+    "runTimeoutMinutes": 45,
+    "idleTimeoutMinutes": 10,
+    "maxRepairCycles": 2,
+    "maxAttempts": 4
+  },
+  "planner": {
+    "enabled": true,
+    "minQueue": 2,
+    "maxQueue": 6,
+    "cooldownMinutes": 10,
+    "maxTasksPerPlan": 4
+  },
+  "checks": {
+    "setup": [["npm", "install"]],
+    "commands": [
+      { "name": "typecheck", "run": ["npm", "run", "typecheck"], "timeoutSeconds": 900 },
+      { "name": "test", "run": ["npm", "test"], "timeoutSeconds": 900 }
+    ]
+  },
+  "integration": {
+    "strategy": "squash",
+    "autoMerge": true,
+    "requireAgentReview": true,
+    "sensitivePaths": [
+      ".github/**", "**/.env*", "**/*.pem", "**/*.key", "**/secrets/**",
+      "**/package.json", "**/package-lock.json", "**/pnpm-lock.yaml", "**/yarn.lock", "**/bun.lockb",
+      "**/migrations/**", "**/supabase/**", "**/*.sql", "**/auth/**", "**/payments/**", "**/billing/**",
+      "**/Dockerfile", "**/docker-compose*.yml", "**/vercel.json", "**/eas.json", "**/firebase.json", "**/*.rules",
+      "CLAUDE.md", "**/CLAUDE.md", ".claude/**"
+    ],
+    "protectedPaths": [".autopilot/**", ".claude/settings.json", ".claude/settings.local.json"],
+    "allowedPaths": [],
+    "maxAutoMergeLines": 1500,
+    "maxOpenPrs": 3
+  },
+  "inbox": {
+    "maxPendingDecisions": 8,
+    "ntfyUrl": null,
+    "ntfyTopic": null,
+    "publicUrl": null
+  },
+  "feedback": {
+    "pollSeconds": 60,
+    "trustedActors": ["your-github-username"]
+  }
+}
