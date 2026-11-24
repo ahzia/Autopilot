@@ -40,7 +40,7 @@ your own service manager.
 ## 2. Install
 
 ```bash
-git clone https://github.com/ahzia/StayOn-Autopilot.git && cd StayOn-Autopilot && npm install
+git clone https://github.com/ahzia/Autopilot.git && cd Autopilot && npm install
 ```
 
 The command is `./bin/autopilot.ts` in the repository folder. To call it as

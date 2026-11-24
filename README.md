@@ -68,8 +68,8 @@ More: [docs/architecture.md](docs/architecture.md).
 ## Quick start (demo, no Claude usage)
 
 ```bash
-git clone https://github.com/ahzia/StayOn-Autopilot.git
-cd StayOn-Autopilot
+git clone https://github.com/ahzia/Autopilot.git
+cd Autopilot
 npm install
 ./bin/autopilot.ts init demo --source /tmp/autopilot-demo --create --runner fake --check "test=node -e process.exit(0)"
 ./bin/autopilot.ts run

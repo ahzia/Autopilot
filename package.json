@@ -15,13 +15,13 @@
     "pwa",
     "web-push"
   ],
-  "homepage": "https://github.com/ahzia/StayOn-Autopilot#readme",
+  "homepage": "https://github.com/ahzia/Autopilot#readme",
   "bugs": {
-    "url": "https://github.com/ahzia/StayOn-Autopilot/issues"
+    "url": "https://github.com/ahzia/Autopilot/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ahzia/StayOn-Autopilot.git"
+    "url": "git+https://github.com/ahzia/Autopilot.git"
   },
   "license": "MIT",
   "author": "ahzia and StayOn contributors",
