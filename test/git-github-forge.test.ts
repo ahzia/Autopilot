@@ -312,6 +312,40 @@ test('integrate merges through gh with --match-head-commit, then fast-forwards t
   assert.ok(!merge.argv.includes('--admin'), 'never bypasses branch protection');
 });
 
+test('when the source does not confirm the sync after a merge, the merge notes say so and the local target stays', async (t) => {
+  class ConfirmFailsAfterMerge extends GitHubForge {
+    merged = false;
+    protected async gh(args: string[]) {
+      if (args[0] === 'pr' && args[1] === 'merge') this.merged = true;
+      return super.gh(args);
+    }
+    protected async remoteBranchHead(branch: string): Promise<string | null> {
+      if (this.merged) throw new Error('the source could not be reached');
+      return super.remoteBranchHead(branch);
+    }
+  }
+  const dir = tempDir(t);
+  const seed = path.join(dir, 'seed');
+  fs.mkdirSync(seed);
+  await sh(seed, 'init', '-q', '-b', 'main');
+  await commitFile(seed, 'README.md', 'hello\n', 'initial');
+  const origin = path.join(dir, 'origin.git');
+  await sh(dir, 'clone', '-q', '--bare', seed, origin);
+  const gh = fakeGh(dir, { 'pr create': { stdout: `${PR_URL}\n` } });
+  const forge = new ConfirmFailsAfterMerge({ source: origin, home: path.join(dir, 'home'), targetBranch: 'main', branchPrefix: 'autopilot/', strategy: 'squash', repo: 'o/r', ghBin: gh.bin, confirmDelayMs: 5 });
+  await forge.prepare();
+  const { head, task } = await taskWithCommit(forge);
+  const before = await forge.targetHead();
+  await forge.publish(task, 'Body');
+  const squash = await githubSquash(forge, origin, head, 'Add feature (T-1)');
+  gh.reply({ 'pr merge': { exec: moveOriginMain(origin, squash) }, 'pr view': prView('MERGED', head, squash) });
+  const res = await forge.integrate({ ...task, prNumber: 7 }, head, async () => [PASSED]);
+  assert.equal(res.status, 'merged', res.details);
+  assert.match(res.details, /the source did not confirm origin's main, so the local main was not updated/);
+  assert.equal(forge.syncStatus(), 'unconfirmed');
+  assert.equal(await forge.targetHead(), before);
+});
+
 test('integrate pushes the checked head before merging when the last publish did not get through', async (t) => {
   const { origin, gh, forge } = await setup(t, { 'pr edit': {} });
   const { wt, task } = await taskWithCommit(forge);

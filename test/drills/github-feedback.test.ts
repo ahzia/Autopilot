@@ -18,8 +18,14 @@ class StubGitHub implements Forge {
   constructor(local: LocalForge) {
     this.local = local;
   }
+  // The supervisor sets these on its forge; the syncs that call them run in the wrapped one.
+  get beforeFastForward() { return this.local.beforeFastForward; }
+  set beforeFastForward(f: Forge['beforeFastForward']) { this.local.beforeFastForward = f ?? null; }
+  get fastForwardFailed() { return this.local.fastForwardFailed; }
+  set fastForwardFailed(f: Forge['fastForwardFailed']) { this.local.fastForwardFailed = f ?? null; }
   prepare() { return this.local.prepare(); }
   targetHead() { return this.local.targetHead(); }
+  upstreamHead() { return this.local.upstreamHead(); }
   createWorktree(id: string, slug: string) { return this.local.createWorktree(id, slug); }
   ensureWorktree(id: string, branch: string) { return this.local.ensureWorktree(id, branch); }
   removeWorktree(p: string) { return this.local.removeWorktree(p); }
@@ -27,6 +33,7 @@ class StubGitHub implements Forge {
   dirtyPaths(p: string) { return this.local.dirtyPaths(p); }
   diff(a: string, b: string, n?: number) { return this.local.diff(a, b, n); }
   integrate(t: Task, head: string, run: Parameters<Forge['integrate']>[2]) { return this.local.integrate(t, head, run); }
+  pushIntegrated(head: string, catchUp?: boolean) { return this.local.pushIntegrated(head, catchUp); }
   async publish(t: Task) { return { prNumber: 7, prUrl: `https://github.com/o/r/pull/7#${t.id}` }; }
   async comment(_t: Task, body: string) { this.comments.push(body); }
   async pollFeedback() { return this.feed.splice(0); }

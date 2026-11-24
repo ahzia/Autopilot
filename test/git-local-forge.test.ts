@@ -10,6 +10,7 @@ import type { LocalForgeOptions } from '../src/git/local-forge.ts';
 import {
   GitError,
   git,
+  gitEnv,
   isSafeBranchName,
   parseConfigList,
   parseNameStatus,
@@ -21,6 +22,7 @@ import {
   revParse,
   runCommand,
 } from '../src/git/git.ts';
+import type { GitOptions } from '../src/git/git.ts';
 import type { CheckResult, Task } from '../src/types.ts';
 import { SAFE_GIT_FLAGS, findSecrets, scrubbedEnv } from '../src/util.ts';
 
@@ -261,7 +263,7 @@ test('integrate squashes onto the target with trailers, and is idempotent', asyn
   assert.equal(await sh(forge.repoPath, 'show', 'main:feature.txt'), 'feature');
 
   const again = await forge.integrate(task, head, checks('passed', seen));
-  assert.deepEqual(again, { status: 'merged', mergedCommit: target, checks: [], details: 'already integrated' });
+  assert.deepEqual(again, { status: 'merged', mergedCommit: target, checks: [], details: 'already integrated', foundOnTarget: true });
   assert.equal(seen.length, 1, 'no second check run');
   assert.equal(await forge.targetHead(), target);
 });
@@ -403,7 +405,7 @@ test('a branch whose changes are already on the target integrates as "no changes
   const head = await forge.headCommit(wt.path);
   const before = await forge.targetHead();
   const res = await forge.integrate(makeTask({ id: 'T-3', branch: wt.branch }), head, checks());
-  assert.deepEqual(res, { status: 'merged', mergedCommit: before, checks: [], details: 'no changes' });
+  assert.deepEqual(res, { status: 'merged', mergedCommit: before, checks: [], details: 'no changes', foundOnTarget: true });
   assert.equal(await forge.targetHead(), before);
 });
 
@@ -413,43 +415,50 @@ test('pushIntegratedTo pushes integrated commits to a branch of the source', asy
   const { head, task } = await buildTask(forge, 'T-1', 'feature.txt', 'feature\n');
   const res = await forge.integrate(task, head, checks());
   assert.equal(res.status, 'merged', res.details);
-  assert.match(res.details, /pushed to autopilot\/main/);
+  assert.equal(await sh(source, 'branch', '--list', 'autopilot/main'), '', 'integrate() itself pushes nothing');
+  assert.equal(await forge.pushIntegrated(res.mergedCommit!), 'pushed to autopilot/main');
   assert.equal(await sh(source, 'rev-parse', 'refs/heads/autopilot/main'), res.mergedCommit);
   assert.equal(await sh(source, 'rev-parse', 'main'), sourceMain, "the source's checked-out branch is untouched");
+  assert.equal(await forge.pushIntegrated(res.mergedCommit!), '', 'nothing left to push');
 
   // A refused push is a warning, not a failed integration.
   const { forge: refused } = await setup(t, { pushIntegratedTo: 'main' });
   const other = await buildTask(refused, 'T-2', 'other.txt', 'other\n');
   const res2 = await refused.integrate(other.task, other.head, checks());
   assert.equal(res2.status, 'merged');
-  assert.match(res2.details, /warning: push to main failed/);
+  assert.match(await refused.pushIntegrated(res2.mergedCommit!), /warning: push to main failed/);
 });
 
-test('a failed push to pushIntegratedTo is caught up by the next integrate() or prepare()', async (t) => {
+test('a failed push to pushIntegratedTo is caught up by the next push, also after a sync', async (t) => {
   const { dir, source, forge } = await setup(t, { pushIntegratedTo: 'autopilot/main' });
   const away = path.join(dir, 'source-away');
   const one = await buildTask(forge, 'T-1', 'one.txt', 'one\n');
-  fs.renameSync(source, away);
   const res = await forge.integrate(one.task, one.head, checks());
   assert.equal(res.status, 'merged', res.details);
-  assert.match(res.details, /warning: push to autopilot\/main failed/);
+  fs.renameSync(source, away);
+  assert.match(await forge.pushIntegrated(res.mergedCommit!), /warning: push to autopilot\/main failed/);
   fs.renameSync(away, source);
 
   // The same head again (e.g. after a crash): already integrated, and the push is retried.
   const again = await forge.integrate(one.task, one.head, checks());
   assert.equal(again.mergedCommit, res.mergedCommit);
-  assert.equal(again.details, 'already integrated; pushed to autopilot/main');
+  assert.equal(again.details, 'already integrated');
+  assert.equal(await forge.pushIntegrated(again.mergedCommit!), 'pushed to autopilot/main');
   assert.equal(await sh(source, 'rev-parse', 'refs/heads/autopilot/main'), res.mergedCommit);
 
   const two = await buildTask(forge, 'T-2', 'two.txt', 'two\n');
-  fs.renameSync(source, away);
   const res2 = await forge.integrate(two.task, two.head, checks());
-  assert.match(res2.details, /warning: push/);
+  fs.renameSync(source, away);
+  assert.match(await forge.pushIntegrated(res2.mergedCommit!), /warning: push/);
   assert.match(forge.pushWarning() ?? '', /push to autopilot\/main failed/);
+  await forge.prepare();
+  assert.equal(await forge.pushIntegrated(res2.mergedCommit!, true), '', 'offline, the catch-up does not even try');
   fs.renameSync(away, source);
   await forge.prepare();
+  assert.equal(await sh(source, 'rev-parse', 'refs/heads/autopilot/main'), res.mergedCommit, 'prepare() itself pushes nothing');
+  assert.equal(await forge.pushIntegrated(res2.mergedCommit!, true), 'pushed to autopilot/main');
   assert.equal(forge.pushWarning(), null);
-  assert.equal(await sh(source, 'rev-parse', 'refs/heads/autopilot/main'), res2.mergedCommit, 'prepare() caught up');
+  assert.equal(await sh(source, 'rev-parse', 'refs/heads/autopilot/main'), res2.mergedCommit, 'caught up after the sync');
 });
 
 test('prepare fast-forwards when the source gains commits and reports divergence', async (t) => {
@@ -902,7 +911,7 @@ test('git output parsers', () => {
   ];
   const expected = { url: '/src/repo', fetch: ORIGIN_FETCH_REFSPEC };
   assert.deepEqual(auditRepoConfig(ours, expected), { unsafe: [], resetUrl: false, resetFetch: false });
-  assert.equal(auditRepoConfig([...ours.slice(0, 1), ['remote.origin.url', '/src/repo/'], ...ours.slice(2)], expected).resetUrl, false, 'same path');
+  assert.equal(auditRepoConfig([...ours.slice(0, 1), ['remote.origin.url', '/src/repo/'], ...ours.slice(2)], expected).resetUrl, true, 'only the exact source');
   const risky: [string, string][] = [
     ['core.sshcommand', 'x'],
     ['remote.origin.pushurl', 'x'],
@@ -927,4 +936,33 @@ test('git output parsers', () => {
 
   for (const ok of ['main', 'autopilot/t-1-add-x', 'release/1.2']) assert.ok(isSafeBranchName(ok), ok);
   for (const bad of ['', '-x', 'a..b', 'a/.hidden', 'x.lock', 'a b', 'a/', 'HEAD', 'a//b']) assert.ok(!isSafeBranchName(bad), bad);
+});
+
+test('the upstream query sees the owner\'s hasconfig:remote.*.url includes, as the fetch does', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-hasconfig-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const founder = path.join(dir, 'founder');
+  const url = 'file:///nonexistent-autopilot-test/repo.git';
+  const g = (...args: string[]) => git(['-c', 'user.name=F', '-c', 'user.email=f@example.com', '-C', founder, ...args], { cwd: dir });
+  fs.mkdirSync(founder);
+  await g('init', '-q', '-b', 'main');
+  await g('commit', '-q', '--allow-empty', '-m', 'A');
+  // The source is reachable only through an insteadOf that an include conditioned on origin's URL adds.
+  const inc = path.join(dir, 'inc.gitconfig');
+  fs.writeFileSync(inc, `[url "file://${founder}"]\n\tinsteadOf = ${url}\n`);
+  const global = path.join(dir, 'global.gitconfig');
+  fs.writeFileSync(global, `[includeIf "hasconfig:remote.*.url:file:///nonexistent-autopilot-test/**"]\n\tpath = ${inc}\n`);
+  class OwnerConfigForge extends LocalForge {
+    protected run(args: string[], cwd: string, opts: Omit<GitOptions, 'cwd'> = {}) {
+      return super.run(args, cwd, { ...opts, env: gitEnv({ GIT_CONFIG_GLOBAL: global }) });
+    }
+  }
+  const forge = new OwnerConfigForge({ source: url, home: path.join(dir, 'home'), targetBranch: 'main', branchPrefix: 'ap/', strategy: 'squash', pushIntegratedTo: null });
+  await forge.prepare();
+  await g('commit', '-q', '--allow-empty', '-m', 'B');
+  const b = (await g('rev-parse', 'HEAD')).stdout.trim();
+  await forge.prepare();
+  assert.equal(forge.syncStatus(), 'fast_forwarded');
+  assert.equal(await forge.targetHead(), b);
+  assert.equal(forge.upstreamHead(), b);
 });

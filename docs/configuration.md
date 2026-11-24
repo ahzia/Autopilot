@@ -135,7 +135,8 @@ The default `disallowedTools` is `["Bash(git push:*)", "Bash(git push)",
 "Bash(rm -rf /:*)"]`. These rules always apply anyway, so removing entries
 allows nothing. Built-in rules also deny `gh pr`, `gh api`, `gh issue`,
 `gh repo`, `gh release`, `gh auth` and `gh secret`; `git push`,
-`git update-ref`, `git branch -f`, `git branch -D`, `git config`,
+`git update-ref`, `git branch -f`, `git branch --force`, `git branch -D`,
+`git branch -M`, `git commit-tree`, `git replace`, `git config`,
 `git remote`, `git worktree` and `git -C`; common credential files (`~/.ssh`,
 `~/.aws`, `~/.config/gh`, `~/.npmrc`, `~/.netrc`) and the autopilot's own
 state. They also deny `Edit`, `Write` and `NotebookEdit` to reviewers and

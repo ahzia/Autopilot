@@ -506,6 +506,14 @@ export interface IntegrationResult {
   mergedCommit: string | null;
   checks: CheckResult[];
   details: string;
+  /**
+   * True when this call itself moved the target branch to mergedCommit, a new integration commit
+   * (LocalForge). Absent when the target already had the work ("already integrated", "no
+   * changes") or the merge happened on the forge (GitHub).
+   */
+  movedTarget?: boolean;
+  /** The work was found on the local target ("already integrated", "no changes"): nothing was merged now. */
+  foundOnTarget?: boolean;
 }
 
 export interface PublishResult {
@@ -520,6 +528,26 @@ export interface Forge {
   prepare(): Promise<string>;
   /** Current commit of the target branch. */
   targetHead(): Promise<string>;
+  /**
+   * The source repository's target-branch head as the source itself confirmed it during the last
+   * prepare() (or GitHub integration), or null when it could not be confirmed (e.g. offline).
+   * Never read from refs/remotes/origin/*, which workers can write.
+   */
+  upstreamHead(): string | null;
+  /**
+   * Set by the supervisor: called with a head the source confirmed (see upstreamHead) right
+   * before the forge fast-forwards the target to it, so the supervisor can store it. A crash
+   * between that move and the supervisor's record of it then does not look like tampering, even
+   * to a restart that cannot reach the source. When it throws, the target does not move.
+   */
+  beforeFastForward?: ((head: string) => void) | null;
+  /**
+   * Set by the supervisor: called with the head passed to beforeFastForward when the
+   * fast-forward to it failed and the target is not on it (or where it is cannot be read), so the
+   * supervisor drops it again: a head the target never moved to must not let a later check take
+   * it (say after the source dropped it).
+   */
+  fastForwardFailed?: ((head: string) => void) | null;
   createWorktree(taskId: string, slug: string): Promise<WorktreeInfo>;
   /** Reattach to an existing task branch (after a crash or for a repair run). */
   ensureWorktree(taskId: string, branch: string): Promise<WorktreeInfo>;
@@ -533,8 +561,18 @@ export interface Forge {
   /**
    * Merge exactly expectedHead of the task branch into the target branch,
    * running integration checks on the merged tree before the target moves.
+   * A forge that moves the target itself calls `beforeMove` with the commit it
+   * is about to move it to and that commit's base, after the checks passed and
+   * right before the move (when it throws, the target does not move): crash
+   * recovery keeps exactly that commit. GitHubForge never calls it.
    */
-  integrate(task: Task, expectedHead: string, runChecks: (cwd: string) => Promise<CheckResult[]>): Promise<IntegrationResult>;
+  integrate(task: Task, expectedHead: string, runChecks: (cwd: string) => Promise<CheckResult[]>, beforeMove?: (commit: string, base: string) => void): Promise<IntegrationResult>;
+  /**
+   * Push `head`, a target head the supervisor has checked and recorded, to the source's
+   * pushIntegratedTo branch (local forge; a no-op without it, and for GitHub). Neither prepare()
+   * nor integrate() pushes. `catchUp`: after a sync, only as a fast-forward. Never throws.
+   */
+  pushIntegrated(head: string, catchUp?: boolean): Promise<string>;
   /** Post a comment on the task's PR (GitHub) or no-op (local). */
   comment(task: Task, body: string): Promise<void>;
   /** New feedback since a cursor (GitHub); local returns []. */

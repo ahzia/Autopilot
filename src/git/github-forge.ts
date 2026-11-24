@@ -27,7 +27,6 @@ export const PUBLISHED_REF_PREFIX = 'refs/autopilot/published/';
 
 const GH_TIMEOUT_MS = 120_000;
 const PUSH_TIMEOUT_MS = 10 * 60_000;
-const REMOTE_QUERY_TIMEOUT_MS = 2 * 60_000;
 /** The best-effort fetch before a builder run must not hold the run up for long when offline. */
 const ADOPT_FETCH_TIMEOUT_MS = 30_000;
 /** `gh pr view` attempts while confirming a merge. */
@@ -130,16 +129,18 @@ export class GitHubForge extends LocalForge {
    * fast-forward the local target to origin's.
    */
   async integrate(task: Task, expectedHead: string, runChecks: RunChecks): Promise<IntegrationResult> {
+    this.confirmedUpstream = null;
     try {
       const gate = await this.checkBranchHead(task, expectedHead);
       if ('result' in gate) return gate.result;
       const branch = requireBranch(task);
       await this.assertSafeRepoConfig();
 
-      // Simulate on the freshest target we can see (best effort when offline).
+      // Simulate on the freshest target we can see (best effort when offline; syncTarget moves
+      // the local target only to a head the source itself confirms).
       if (await this.fetchOrigin()) await this.syncTarget();
       const already = await this.findIntegrated(task.id, gate.head);
-      if (already) return { status: 'merged', mergedCommit: already, checks: [], details: 'already integrated' };
+      if (already) return { status: 'merged', mergedCommit: already, checks: [], details: 'already integrated', foundOnTarget: true };
 
       // GitHub must merge what is checked here, so the PR branch has to show this head (an
       // earlier publish may have failed). A branch origin no longer has belongs to a merged or
@@ -251,18 +252,6 @@ export class GitHubForge extends LocalForge {
     if (r.code === 0) return line?.startsWith('=') ? 'up_to_date' : 'pushed';
     if (line?.startsWith('!') && line.includes('stale info')) return 'stale';
     throw new GitError(args, r.code, [r.stderr.trim(), line ?? ''].filter(Boolean).join('\n'));
-  }
-
-  /** Where origin's branch is right now (null when it does not exist). Throws when origin is unreachable. */
-  private async remoteBranchHead(branch: string): Promise<string | null> {
-    const ref = `refs/heads/${branch}`;
-    const r = await this.run(['ls-remote', 'origin', ref], this.repoPath, { timeoutMs: REMOTE_QUERY_TIMEOUT_MS });
-    for (const line of r.stdout.split('\n')) {
-      const [sha, name] = line.split('\t');
-      // ls-remote matches patterns by tail ("x/refs/heads/b" too): only the exact ref counts.
-      if (name?.trim() === ref && /^[0-9a-f]{40,64}$/.test(sha)) return sha;
-    }
-    return null;
   }
 
   /**
@@ -388,8 +377,11 @@ export class GitHubForge extends LocalForge {
     let originHead: string | null = null;
     try {
       if (await this.fetchOrigin()) {
-        originHead = await revParse(this.repoPath, this.remoteTargetRef);
-        if ((await this.syncTarget()) === 'diverged') note += `; warning: local ${this.targetBranch} has diverged from origin`;
+        const sync = await this.syncTarget();
+        // Only a head the source itself confirmed in this sync, never the worker-writable tracking ref.
+        if (sync !== 'unconfirmed') originHead = this.upstreamHead();
+        if (sync === 'diverged') note += `; warning: local ${this.targetBranch} has diverged from origin`;
+        if (sync === 'unconfirmed') note += `; warning: the source did not confirm origin's ${this.targetBranch}, so the local ${this.targetBranch} was not updated`;
       } else {
         note += `; warning: fetch after merge failed: ${clip(this.fetchError() ?? '', 300)}`;
       }

@@ -135,11 +135,47 @@ Within that model:
 
 * **Target branch integrity.** Worktrees share refs with the private clone, so
   a builder could move the target branch with `git update-ref`, `branch -f` or a
-  local push. The supervisor records the last head it set, checks it every tick
-  and before every merge, and on any mismatch restores it, pauses the project
-  and raises an urgent card (drill: "a builder that moves the target branch").
-  Its own merge commits are recognized by their trailers and parent, including
-  after a crash between merging and recording.
+  local fetch or push. The supervisor records the head it set, exactly as it
+  checked it (a new merge commit must sit directly on the recorded head; a
+  merge that found nothing to do records nothing), checks it every tick and
+  before every merge, and on any mismatch restores it, pauses the project and
+  raises an urgent card (drill: "a builder that moves the target branch"),
+  however much the new head looks like one of its own merges. Only two
+  unrecorded moves are kept. One is the repository sync's fast-forward to
+  the source repository's branch, and only to the head that the source itself
+  reports right after a fetch that brought that commit. The supervisor asks
+  the configured source with `git ls-remote` run outside any repository, so
+  neither `refs/remotes/origin/*` nor the clone's config (origin's URL, which
+  must be exactly the configured source, or an `insteadOf` rule) counts, since
+  workers can write those too; offline nothing moves. The query gets origin's
+  URL on its command line, so `includeIf "hasconfig:remote.*.url:..."` rules
+  in your git config apply to it as they do to the fetch, but `gitdir:` and
+  `onbranch:` rules do not: settings needed to reach the source must not
+  depend on them. The database keeps the confirmed head from just before the
+  sync moves `main` to it until the supervisor has checked that move, or the
+  move failed, so a crash in between is not taken for tampering, even by a
+  restart that cannot reach the source (should the database fail to note that
+  a move failed, only the running supervisor remembers it: a restart before
+  the next check would trust that head again). The other is a merge that a
+  crash cut off before it was recorded: on the project's first check after a
+  restart (the database remembers the interrupted merge until then, should
+  that restart die too), before any worker of the project runs, the supervisor
+  keeps an unrecorded head only if it is exactly the integration commit that
+  the interrupted merge stored just before it moved the target, once its
+  integration checks had passed. A copy that a worker made of that merge while
+  it ran is caught like any other move.
+  Integrated work is pushed to `repo.pushIntegratedTo` only after these
+  checks, and only the checked head, so a target branch that a worker moved
+  never reaches your repository. These checks trust the source as your git
+  setup reaches it: workers run as your user, so without OS-level isolation a
+  worker can still write a local source repository itself, or add an
+  `insteadOf` rule to your global git config, which the supervisor's own git
+  reads too. The sync then takes the head the worker planted for the source's
+  own and pushes it to `repo.pushIntegratedTo`. Likewise, merges are built in
+  an integration worktree inside the private clone: a worker process that
+  rewrites that worktree's `HEAD` or index while a merge runs can make the
+  supervisor move the target to, record and push a commit other than the
+  merge it checked.
 * **Policy changes need you.** A `config.json` that changes while the
   autopilot runs (or differs from the last approved one at restart) produces an
   authorization card; until you approve, the previous policy stays in force.
@@ -226,6 +262,8 @@ runner against temporary repositories:
 | Planner dependencies | Foundation task runs alone first; dependents follow. |
 | Plan application (`planner.test.ts`) | Duplicate titles skipped, `maxTasksPerPlan` enforced, dependency cycles broken, proposals accepted, obsolete tasks cancelled, questions are non-blocking, an answer invites a new plan. |
 | GitHub feedback (`github-feedback.test.ts`) | Trusted change request repairs once even if redelivered; untrusted comments ignored; a trusted GitHub approval of the exact head merges and supersedes the card; feedback after merge becomes a follow-up task; `/approve` needs the card's one-time code. |
-| Target branch tampering | A builder that moves `main` is caught; `main` restored; project paused with an urgent card; the work later merges only through the gate. |
+| Target branch tampering | A builder that moves `main` is caught; `main` restored; project paused with an urgent card; the work later merges only through the gate. A forged copy of the supervisor's own merge commit is caught the same way. |
+| Crash between merging and recording | After the restart, the interrupted merge is kept (not merged twice) and the queue continues; any other unrecorded commit on `main` is tampering. |
+| Target integrity (`target-integrity.test.ts`) | A forged `origin/main` behind a ref lock never moves `main`; `main` moved along with it, or to a head the source cannot vouch for at the sync (origin redirected before the fetch, `origin/main` rewritten or the source unreachable after it), is caught at the sync and restored; origin redirected between the config audit and the fetch (its URL rewritten, an `insteadOf` rule in the clone's config, or a relative URL that names the source only from the supervisor's directory) never moves `main`, on GitHub either, and none of it reaches your repository; a head moved in before a sync or under a merge is caught before anything is pushed to your repository; a head moved between a check and its record is never recorded, and an "already integrated" or "no changes" merge on a moved `main` is tampering, on GitHub too; a merge is recorded before anything else can fail, so a failure right after it raises no card; after a GitHub merge, or one GitHub refused after its sync moved `main`, only the head the source confirms is recorded, also when the sync after the merge cannot move `main`; a real upstream push is fast-forwarded with no card; a head a sync confirmed counts only until its move was checked or failed: a sync a crash cut off right after its fast-forward is kept by a restart that cannot reach the source, also when git lost the exit status of a fast-forward that moved `main`, a head that cannot be stored never moves `main`, and a head whose fast-forward failed is never taken later, even after the source dropped it, by a restart, through the confirmation of that same sync, while a worker moves `main` around the failure or when `main` cannot be read after it, or, until the supervisor restarts, when the database could not note the failure; offline, work continues and the push catches up later; a merge a crash cut off is still kept when the restart after it dies, or stays paused, before its first check, and only until that check, while a copy of the merge in flight that a worker put on `main` is not kept when the supervisor dies, and a later merge job never runs with the record of an attempt that died before moving `main`. |
 | Quota governor | After a usage warning, later builders start only when no other builder runs. |
 | Regressions (`regressions.test.ts`) | Policy edits need approval and update the runtime in place; a rejected revision never merges; cancelling one task keeps a shared card for the others; no cancel during a merge; secrets never published or merged, even when a later commit removed them, they follow more than 2 MB of other changes or a branch reaches a `.env` file only by renaming another file, and a history too large to scan fails closed; a replace ref cannot hide a change from the merge gate; reviewers and the planner get no git command that can write files; an answer arriving before the run ends resumes without a second card; a builder that switches branches keeps its work; after merging `main` into its branch, a task is judged only on its own changes. |

@@ -10,6 +10,7 @@ import { dirname, join } from 'node:path';
 import { killAllCheckProcesses } from './checks.ts';
 import { configHash, DEFAULT_DISALLOWED_TOOLS, profileAllowsDispatch, stableStringify, type ProjectConfig } from './config.ts';
 import { git, redact, type GitOptions } from './git/git.ts';
+import { findIntegrationCommit } from './git/local-forge.ts';
 import type { Home } from './home.ts';
 import { classifyMerge, reviewCardText, type MergeVerdict } from './policy/merge-policy.ts';
 import { ownershipOverlaps } from './policy/glob.ts';
@@ -37,6 +38,7 @@ import type {
   Decision,
   DiffSummary,
   Forge,
+  IntegrationResult,
   Notifier,
   Run,
   RunEvent,
@@ -146,7 +148,11 @@ const BUILDER_DENY = [
   'Bash(gh secret:*)',
   'Bash(git update-ref:*)',
   'Bash(git branch -f:*)',
+  'Bash(git branch --force:*)',
   'Bash(git branch -D:*)',
+  'Bash(git branch -M:*)',
+  'Bash(git commit-tree:*)',
+  'Bash(git replace:*)',
   'Bash(git push:*)',
   'Bash(git -C:*)',
   'Bash(git config:*)',
@@ -275,8 +281,79 @@ export class Supervisor implements SupervisorActions {
     }
     for (const t of this.store.leasesHeldBy(() => true)) {
       const to = recoveryState(t.state);
-      this.store.breakLease(t.id, t.leaseOwner!, to, 'supervisor restarted');
+      // One transaction: once the lease is broken, no later restart would find the merge again.
+      this.store.tx(() => {
+        const recovered = this.store.breakLease(t.id, t.leaseOwner!, to, 'supervisor restarted');
+        if (!recovered || t.state !== 'merging') return;
+        const ids = this.interruptedMerges(t.projectId);
+        if (!ids.includes(t.id)) this.store.setKv(`interrupted_merges:${t.projectId}`, JSON.stringify([...ids, t.id]));
+      });
       if (t.state === 'building') this.store.addNote(t.id, 'supervisor', 'The previous run was interrupted by a supervisor restart; continue from the current branch state.');
+    }
+  }
+
+  /**
+   * The project's tasks whose merge a previous supervisor process left unfinished, as crash
+   * recovery found them (see isOwnMergeOnTop). Stored, so that a crash before the project's first
+   * target check after the restart does not lose them, and kept only until that check or the
+   * start of any worker run of the project (endCrashRecovery).
+   */
+  private interruptedMerges(projectId: string): string[] {
+    return this.kvList(`interrupted_merges:${projectId}`);
+  }
+
+  /** The merge a merge job is about to move the target to (written before its compare-and-swap). */
+  private pendingMerge(projectId: string): { taskId: string; base: string; commit: string } | null {
+    try {
+      const v = JSON.parse(this.store.getKv(`merge_pending:${projectId}`) ?? 'null');
+      return v && typeof v.taskId === 'string' && typeof v.base === 'string' && typeof v.commit === 'string' ? v : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private endCrashRecovery(projectId: string): void {
+    this.store.setKv(`interrupted_merges:${projectId}`, null);
+  }
+
+  /**
+   * Heads of the source's branch that the project's forge was about to fast-forward the target
+   * to, as the source confirmed them (Forge.beforeFastForward), since the target was last
+   * checked after a sync (see isUpstreamAdvance). Stored before the target moves, so that a crash
+   * between the move and its record does not look like tampering, even to a restart that cannot
+   * reach the source; dropped once that check has run (forgetUpstream).
+   */
+  private upstreamHeads(projectId: string): string[] {
+    return this.kvList(`upstream_heads:${projectId}`);
+  }
+
+  /** Heads dropped by unrememberUpstream in this process, so that a drop the store failed to keep still counts. */
+  private readonly unvouched = new Set<string>();
+
+  private rememberUpstream(projectId: string, head: string): void {
+    const heads = this.upstreamHeads(projectId);
+    if (!heads.includes(head)) this.store.setKv(`upstream_heads:${projectId}`, JSON.stringify([...heads, head].slice(-10)));
+    this.unvouched.delete(`${projectId}:${head}`);
+  }
+
+  private unrememberUpstream(projectId: string, head: string): void {
+    this.unvouched.add(`${projectId}:${head}`); // first: a store error must not leave it vouched for
+    const heads = this.upstreamHeads(projectId);
+    if (heads.includes(head)) this.store.setKv(`upstream_heads:${projectId}`, JSON.stringify(heads.filter((h) => h !== head)));
+  }
+
+  private forgetUpstream(projectId: string): void {
+    this.store.setKv(`upstream_heads:${projectId}`, null);
+    for (const key of this.unvouched) if (key.startsWith(`${projectId}:`)) this.unvouched.delete(key);
+  }
+
+  /** A JSON list of strings kept in the kv table; a malformed value reads as empty. */
+  private kvList(key: string): string[] {
+    try {
+      const items: unknown = JSON.parse(this.store.getKv(key) ?? '[]');
+      return Array.isArray(items) ? items.filter((item): item is string => typeof item === 'string') : [];
+    } catch {
+      return [];
     }
   }
 
@@ -352,6 +429,8 @@ export class Supervisor implements SupervisorActions {
       this.store.setProjectPaused(cfg.id, true, `invalid config: ${(err as Error).message}`.slice(0, 300));
       return;
     }
+    parts.forge.beforeFastForward = (head) => this.rememberUpstream(cfg.id, head);
+    parts.forge.fastForwardFailed = (head) => this.unrememberUpstream(cfg.id, head);
     const before = this.store.getProject(cfg.id);
     this.store.upsertProject(cfg);
     if (before?.paused && before.pauseReason?.startsWith('invalid config')) this.store.setProjectPaused(cfg.id, false, 'config is valid again');
@@ -524,41 +603,116 @@ export class Supervisor implements SupervisorActions {
   }
 
   /**
-   * True when `actual` is the supervisor's own integration commit directly on top
-   * of `expected` for a task that is being merged. This guards against confused or
-   * careless git commands; a determined process running as the same OS user could
-   * forge it, which only OS-level isolation prevents (see docs/architecture.md).
+   * True when `actual` is the integration commit of the merge that a crash interrupted between
+   * moving the target and recording it: exactly the commit that merge job announced
+   * (merge_pending) once its integration checks had passed, right before its compare-and-swap,
+   * directly on top of `expected`, for the one task that was merging when a previous supervisor
+   * process stopped (crash recovery left it in merge_ready), and made for that task's recorded
+   * head. Only during startup crash recovery, until the project's first target check after the
+   * restart (should a restart die before that check, the next one still counts) and before any
+   * worker of the project runs: at any other time an unrecorded move is tampering, however its
+   * commit looks, since a worker can write any parent and trailers. A copy that a worker made of
+   * the merge in flight while it ran (ticks skip the target check during a merge) is a different
+   * commit. A process running as the same OS user could still forge the record itself; only
+   * OS-level isolation prevents that (see docs/architecture.md).
    */
   private async isOwnMergeOnTop(rt: ProjectRuntime, expected: string, actual: string): Promise<boolean> {
-    if (!rt.barePath) return false;
+    const interrupted = this.interruptedMerges(rt.cfg.id);
+    if (!rt.barePath || interrupted.length !== 1) return false;
+    const t = this.store.getTask(interrupted[0]);
+    if (!t?.headCommit || t.projectId !== rt.cfg.id || (t.state !== 'merge_ready' && t.state !== 'merging')) return false;
+    // Only the exact commit the merge job announced right before its compare-and-swap, once its
+    // checks had passed: while a merge runs (ticks skip the target check) a worker can copy its
+    // parent, subject and trailers onto other content, but not that commit.
+    const pending = this.pendingMerge(rt.cfg.id);
+    if (!pending || pending.taskId !== t.id || pending.base !== expected || pending.commit !== actual) return false;
     const parent = await safeGit(['rev-parse', '--verify', '--quiet', `${actual}^1`], { cwd: rt.barePath, allowFail: true });
     if (parent.stdout.trim() !== expected) return false;
-    const msg = await safeGit(['log', '-1', '--format=%B', actual], { cwd: rt.barePath, allowFail: true });
-    const id = /^Autopilot-Task: (T-\d+)$/m.exec(msg.stdout)?.[1];
-    const t = id ? this.store.getTask(id) : null;
-    return !!t && t.projectId === rt.cfg.id && (t.state === 'merging' || t.state === 'merge_ready');
+    // The same test the forge uses to find its own integration of a task head (subject and trailers).
+    const format = '--format=%H%x1f%(trailers:only,unfold)%x1f%s';
+    const log = await safeGit(['log', '-1', '-z', '--no-show-signature', format, actual, '--'], { cwd: rt.barePath, allowFail: true });
+    return findIntegrationCommit(log.stdout, t.id, t.headCommit) === actual;
   }
 
-  /** Record the target head after a change the supervisor itself made (prepare/merge). */
-  private async recordTarget(rt: ProjectRuntime): Promise<void> {
-    const head = await rt.forge.targetHead().catch(() => null);
-    if (head) this.store.setKv(`target_head:${rt.cfg.id}`, head);
+  /**
+   * True when `actual`, an unrecorded target head, is the source repository's own branch head as
+   * the forge confirmed it from the source at its last sync, or at any sync whose fast-forward
+   * has not been checked yet (upstreamHeads: a crash may have come in between), and
+   * fast-forwards the recorded head `expected`. refs/remotes/origin/* never decides this: a
+   * worker can write it, and make the fetch that would correct it fail (a ref lock).
+   */
+  private async isUpstreamAdvance(rt: ProjectRuntime, expected: string, actual: string): Promise<boolean> {
+    if (!rt.barePath) return false;
+    // A head whose fast-forward failed in this process: neither the forge's last confirmation nor
+    // the stored list vouches for it.
+    if (this.unvouched.has(`${rt.cfg.id}:${actual}`)) return false;
+    if (rt.forge.upstreamHead() !== actual && !this.upstreamHeads(rt.cfg.id).includes(actual)) return false;
+    const ff = await safeGit(['merge-base', '--is-ancestor', expected, actual], { cwd: rt.barePath, allowFail: true });
+    return ff.code === 0;
+  }
+
+  /**
+   * After a merge the forge reported as done, or any GitHub integration, check the target against
+   * the recorded head `expected`. Returns the head to record: exactly the one checked, never a
+   * fresh read (a worker could move the target in between); null when there is nothing new to
+   * record; false when the target was moved behind the supervisor's back. A new integration commit
+   * must sit directly on the recorded head. An "already integrated" or "no changes" result moved
+   * nothing, so its commit must already be in the recorded history (after a GitHub integration,
+   * the recorded history plus the source's confirmed head). After a GitHub integration, whatever
+   * its outcome (it syncs with the source before merging, so even a refused merge may have
+   * fast-forwarded the local target), the local target may only have moved to the source's
+   * confirmed head.
+   */
+  private async checkMerged(rt: ProjectRuntime, result: IntegrationResult, expected: string): Promise<string | null | false> {
+    const cwd = rt.barePath!;
+    const merged = result.mergedCommit;
+    if (result.movedTarget && merged) {
+      const parent = await safeGit(['rev-parse', '--verify', '--quiet', `${merged}^1`], { cwd, allowFail: true });
+      return parent.stdout.trim() === expected ? merged : false;
+    }
+    if (rt.forge.kind === 'local') {
+      if (!merged) return null;
+      const known = await safeGit(['merge-base', '--is-ancestor', merged, expected], { cwd, allowFail: true });
+      return known.code === 0 ? null : false;
+    }
+    const actual = await rt.forge.targetHead().catch(() => null);
+    const advanced = actual && actual !== expected && (await this.isUpstreamAdvance(rt, expected, actual)) ? actual : null;
+    if (result.foundOnTarget && merged) {
+      // Found on the local target rather than merged on GitHub now: it must be in the history recorded here.
+      const known = await safeGit(['merge-base', '--is-ancestor', merged, advanced ?? expected], { cwd, allowFail: true });
+      if (known.code !== 0) return false;
+    }
+    return advanced;
   }
 
   private async prepare(rt: ProjectRuntime): Promise<void> {
     rt.preparedAt = this.now();
     try {
       rt.barePath = await rt.forge.prepare();
-      // Accept a moved target only when it is a fast-forward to the source repository's
-      // branch (someone pushed upstream); anything else is tampering (e.g. after a restart).
-      const expected = this.store.getKv(`target_head:${rt.cfg.id}`);
-      const actual = await rt.forge.targetHead().catch(() => null);
-      if (expected && actual && actual !== expected) {
-        const origin = await safeGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${rt.cfg.repo.targetBranch}`], { cwd: rt.barePath, allowFail: true });
-        const ff = await safeGit(['merge-base', '--is-ancestor', expected, actual], { cwd: rt.barePath, allowFail: true });
-        if ((origin.stdout.trim() !== actual || ff.code !== 0) && !(await this.verifyTarget(rt))) return;
+      const key = `target_head:${rt.cfg.id}`;
+      try {
+        // Accept a moved target only when it is a fast-forward to the source repository's
+        // branch as the source itself reports it (someone pushed upstream); anything else is
+        // tampering (e.g. after a restart). Offline, nothing was fast-forwarded to accept.
+        // Record exactly the head checked here, never a fresh read: a worker could move the
+        // target in between.
+        const expected = this.store.getKv(key);
+        const actual = await rt.forge.targetHead().catch(() => null);
+        if (actual && actual !== expected) {
+          if (!expected || (await this.isUpstreamAdvance(rt, expected, actual))) this.store.setKv(key, actual);
+          else if (!(await this.verifyTarget(rt))) return; // (verifyTarget records the merge a crash cut off)
+        }
+      } finally {
+        // Crash recovery ends with the first check after a restart, before any worker of the
+        // project can start: from now on every unrecorded move of the target is tampering. The
+        // syncs' fast-forwards have been checked too.
+        this.endCrashRecovery(rt.cfg.id);
+        this.forgetUpstream(rt.cfg.id);
       }
-      await this.recordTarget(rt);
+      // Only now may integrated work leave the clone, and only the head that was checked:
+      // catch up on a push that failed or was cut short.
+      const checked = this.store.getKv(key);
+      if (checked) await rt.forge.pushIntegrated(checked, true);
       if (rt.prepareError) this.store.event({ projectId: rt.cfg.id, type: 'project.prepared', message: 'Repository ready again' });
       rt.prepareError = null;
       for (const d of this.store.listDecisions({ projectId: rt.cfg.id, status: ['pending'] })) {
@@ -894,6 +1048,7 @@ export class Supervisor implements SupervisorActions {
     },
   ): void {
     const cfg = rt.cfg;
+    this.endCrashRecovery(cfg.id); // crash recovery never outlasts the first worker run (see prepare)
     if (this.stopping) {
       // Shutdown began while this run was being prepared: never spawn it.
       if (r.task && this.ownsLease(r.task.id, r.runId, r.generation)) {
@@ -1579,6 +1734,9 @@ export class Supervisor implements SupervisorActions {
   private async mergeTask(rt: ProjectRuntime, t: Task, owner: string, generation: number): Promise<void> {
     const cfg = rt.cfg;
     try {
+      // A record left by a merge job that died before its compare-and-swap belongs to that job, and
+      // crash recovery is over once merges run: this job stores its own once its checks pass.
+      this.store.setKv(`merge_pending:${rt.cfg.id}`, null);
       const head = t.headCommit!;
       // The branch ref is the source of truth (not whatever the worktree has checked out).
       const ref = await safeGit(['rev-parse', '--verify', '--quiet', `refs/heads/${t.branch}`], { cwd: rt.barePath!, allowFail: true });
@@ -1643,23 +1801,27 @@ export class Supervisor implements SupervisorActions {
       const result = await rt.forge.integrate(t, head, async (cwd) => {
         const setup = await rt.checks.setup(cwd);
         return [...setup.filter((r) => r.status !== 'passed'), ...(await rt.checks.run(cwd))];
-      });
+      }, (commit, base) => this.store.setKv(`merge_pending:${rt.cfg.id}`, JSON.stringify({ taskId: t.id, base, commit })));
+      // Close the window between the check above and the merge (see checkMerged). The head that
+      // passes is recorded before anything else can fail: unrecorded, our own merge would read as
+      // tampering at the next check. A GitHub integration may have moved the local target to the
+      // source's head even when the merge itself failed.
+      const checked = expectedTarget && rt.barePath && (result.status === 'merged' || rt.forge.kind === 'github') ? await this.checkMerged(rt, result, expectedTarget) : null;
+      if (checked) this.store.setKv(`target_head:${rt.cfg.id}`, checked);
+      this.store.setKv(`merge_pending:${rt.cfg.id}`, null);
+      this.forgetUpstream(rt.cfg.id); // the integration's own syncs have been checked
       if (result.checks.length) this.store.recordChecks(t.id, head, 'integration', result.checks);
-      if (result.status === 'merged' && result.mergedCommit && expectedTarget && rt.forge.kind === 'local' && rt.barePath) {
-        // Close the window between the check above and the merge: a new merge must sit on the
-        // recorded head (an idempotent "already integrated" result is already in its history).
-        const parent = await safeGit(['rev-parse', '--verify', '--quiet', `${result.mergedCommit}^1`], { cwd: rt.barePath, allowFail: true });
-        const known = await safeGit(['merge-base', '--is-ancestor', result.mergedCommit, expectedTarget], { cwd: rt.barePath, allowFail: true });
-        if (parent.stdout.trim() !== expectedTarget && result.mergedCommit !== expectedTarget && known.code !== 0) {
-          this.store.setKv(`target_head:${rt.cfg.id}`, expectedTarget);
-          await this.verifyTarget(rt);
-          this.store.release(t.id, owner, generation, 'merge_ready', 'target moved during the merge; project paused');
-          return;
-        }
+      if (checked === false) {
+        this.store.setKv(`target_head:${rt.cfg.id}`, expectedTarget!);
+        await this.verifyTarget(rt);
+        this.store.release(t.id, owner, generation, 'merge_ready', 'target moved during the merge; project paused');
+        return;
       }
       switch (result.status) {
         case 'merged': {
-          await this.recordTarget(rt);
+          // The merge passed the check above: only now may it leave the clone.
+          const recorded = this.store.getKv(`target_head:${rt.cfg.id}`);
+          if (recorded) await rt.forge.pushIntegrated(recorded);
           this.store.setKv(`job_errors:merge:${t.id}`, null);
           this.store.release(t.id, owner, generation, 'integrated', humanApproved ? 'merged after founder approval' : 'auto-merged', {});
           this.store.event({

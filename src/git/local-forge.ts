@@ -51,7 +51,8 @@ import {
 } from './git.ts';
 import type { GitOptions, GitResult } from './git.ts';
 
-export type SyncStatus = 'up_to_date' | 'fast_forwarded' | 'diverged' | 'no_remote';
+/** 'unconfirmed': the source's head could not be confirmed (see syncTarget), so nothing moved. */
+export type SyncStatus = 'up_to_date' | 'fast_forwarded' | 'diverged' | 'no_remote' | 'unconfirmed';
 
 export type RunChecks = (cwd: string) => Promise<CheckResult[]>;
 
@@ -80,10 +81,17 @@ export const ORIGIN_FETCH_REFSPEC = '+refs/heads/*:refs/remotes/origin/*';
 /** Checkouts (worktree add, checkout, reset --hard, merge) of big repositories, or with LFS, can be slow. */
 export const CHECKOUT_TIMEOUT_MS = 30 * 60_000;
 
+/**
+ * Where git runs when no repository may be involved: the filesystem root, where git finds no
+ * repository, so no repository config applies (workers can write repo.git/config).
+ */
+const OUTSIDE_ANY_REPOSITORY = resolve('/');
+
 const INTEGRATION_DIR = '_integration';
 const CLONE_TIMEOUT_MS = 30 * 60_000;
 const FETCH_TIMEOUT_MS = 10 * 60_000;
 const PUSH_TIMEOUT_MS = 10 * 60_000;
+const REMOTE_QUERY_TIMEOUT_MS = 2 * 60_000;
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 /** Outcome of merging a task head onto the target inside the integration worktree. */
@@ -110,6 +118,12 @@ export class LocalForge implements Forge {
   private lastSync: SyncStatus = 'no_remote';
   private lastFetchError: string | null = null;
   private lastPushWarning: string | null = null;
+  /** See upstreamHead(); cleared when prepare() (or a GitHub integration) starts. */
+  protected confirmedUpstream: string | null = null;
+  /** See Forge.beforeFastForward. */
+  beforeFastForward: ((head: string) => void) | null = null;
+  /** See Forge.fastForwardFailed. */
+  fastForwardFailed: ((head: string) => void) | null = null;
 
   constructor(opts: LocalForgeOptions) {
     if (!opts.source) throw new Error('forge: source is required');
@@ -166,6 +180,17 @@ export class LocalForge implements Forge {
     return this.lastPushWarning;
   }
 
+  /**
+   * The head of the source's target branch as the source itself reported it (see
+   * remoteBranchHead) in a sync of the last prepare() (or GitHub integration), with the fetch
+   * having brought that very commit; null when no sync could confirm it. Never taken from
+   * refs/remotes/origin/* or origin's configured URL: worktrees share refs and config with the
+   * private clone, so any worker can write those.
+   */
+  upstreamHead(): string | null {
+    return this.confirmedUpstream;
+  }
+
   /** Branch name for a task: <prefix><taskId lowercased>-<slug>. */
   branchFor(taskId: string, slug: string): string {
     assertTaskId(taskId);
@@ -183,6 +208,7 @@ export class LocalForge implements Forge {
 
   async prepare(): Promise<string> {
     await mkdir(this.worktreesDir, { recursive: true });
+    this.confirmedUpstream = null;
     if (existsSync(this.repoPath)) {
       await this.assertBareClone();
       await this.assertSafeRepoConfig();
@@ -193,8 +219,7 @@ export class LocalForge implements Forge {
     }
     await this.ensureLocalTarget();
     await this.syncTarget();
-    // Catch up on a push of integrated work that failed or was cut short (needs fresh remote refs).
-    if (this.pushIntegratedTo && this.lastFetchError === null) await this.pushIntegratedWork(true);
+    // Nothing is pushed here: the target is not checked yet (see pushIntegrated).
     return this.repoPath;
   }
 
@@ -211,19 +236,33 @@ export class LocalForge implements Forge {
     return r.code === 0;
   }
 
-  /** Fast-forward the local target to origin's when origin is strictly ahead; never rewrites it. */
+  /**
+   * Fast-forward the local target to the source's branch when that is strictly ahead; never
+   * rewrites it. The source's head is asked from the source itself after the fetch (see
+   * confirmUpstream); when it cannot be confirmed (offline, a failed fetch or query) nothing
+   * moves, and the autopilot keeps working from what it has.
+   */
   protected async syncTarget(): Promise<SyncStatus> {
+    const remote = this.lastFetchError === null ? await this.confirmUpstream() : undefined;
+    if (remote === undefined) return (this.lastSync = 'unconfirmed');
+    this.confirmedUpstream = remote;
     for (let attempt = 0; attempt < 3; attempt++) {
-      const remote = await revParse(this.repoPath, this.remoteTargetRef);
       const local = await revParse(this.repoPath, this.targetRef);
       if (!remote || !local) return (this.lastSync = 'no_remote');
       if (remote === local) return (this.lastSync = 'up_to_date');
       if (await isAncestor(this.repoPath, local, remote)) {
+        this.beforeFastForward?.(remote);
         const args = ['update-ref', this.targetRef, remote, local];
         const cas = await this.run(args, this.repoPath, { allowFail: true });
         if (cas.code === 0) return (this.lastSync = 'fast_forwarded');
+        // The target did not move to it (an exit status can be lost after the move): stop vouching for it.
+        const now = await revParse(this.repoPath, this.targetRef).catch((err: unknown) => {
+          this.fastForwardFailed?.(remote); // where the target is cannot be told: stop vouching for it
+          throw err;
+        });
+        if (now !== remote) this.fastForwardFailed?.(remote);
         // Unchanged target means a real failure (e.g. a stale lock), not a race: report it.
-        if ((await revParse(this.repoPath, this.targetRef)) === local) throw new GitError(args, cas.code, cas.stderr);
+        if (now === local) throw new GitError(args, cas.code, cas.stderr);
         continue; // the target moved under us; look again
       }
       // Local ahead of origin is normal: integrated work that origin does not have (yet).
@@ -231,6 +270,45 @@ export class LocalForge implements Forge {
       return (this.lastSync = 'diverged');
     }
     throw new Error(`target branch ${this.targetBranch} kept moving while syncing with origin`);
+  }
+
+  /**
+   * The source's target head as the source reports it right after a fetch (null: it has no such
+   * branch), or undefined when that cannot be confirmed: the query failed, or the fetched
+   * refs/remotes/origin/<target> disagrees (the source moved since the fetch, a worker wrote the
+   * ref, or the fetch went elsewhere because a worker rewrote origin's URL after the config
+   * audit). Agreement also means the fetch brought the commit. The tracking ref alone never
+   * counts: worktrees share refs with the private clone.
+   */
+  private async confirmUpstream(): Promise<string | null | undefined> {
+    let remote: string | null;
+    try {
+      remote = await this.remoteBranchHead(this.targetBranch);
+    } catch {
+      return undefined;
+    }
+    return remote === (await revParse(this.repoPath, this.remoteTargetRef)) ? remote : undefined;
+  }
+
+  /**
+   * Where the source's branch is right now (null when it does not exist), as the source itself
+   * reports it. Asked from the configured source by a git that runs outside any repository, so
+   * that no repository config decides where it connects: workers can write repo.git/config (and
+   * rewrite origin's URL right after the config audit). Throws when the source is unreachable.
+   */
+  protected async remoteBranchHead(branch: string): Promise<string | null> {
+    const ref = `refs/heads/${branch}`;
+    // remote.origin.url is the configured source, as the audit keeps it in the clone, so the
+    // owner's includeIf "hasconfig:remote.*.url:..." rules (SSH key, credentials, insteadOf) apply
+    // here as they do to the fetch. No repository config is read; gitdir: rules cannot match.
+    const args = ['-c', `remote.origin.url=${this.source}`, 'ls-remote', '--', this.source, ref];
+    const r = await this.run(args, OUTSIDE_ANY_REPOSITORY, { timeoutMs: REMOTE_QUERY_TIMEOUT_MS });
+    for (const line of r.stdout.split('\n')) {
+      const [sha, name] = line.split('\t');
+      // ls-remote matches patterns by tail ("x/refs/heads/b" too): only the exact ref counts.
+      if (name?.trim() === ref && /^[0-9a-f]{40,64}$/.test(sha)) return sha;
+    }
+    return null;
   }
 
   private async cloneSource(): Promise<void> {
@@ -292,24 +370,26 @@ export class LocalForge implements Forge {
   }
 
   /**
-   * Push the target head to origin's pushIntegratedTo branch when origin does not have it yet;
-   * this also catches up on pushes that failed earlier or were cut short by a crash. Never throws.
-   * Returns a note for result details: '' when there was nothing to push.
+   * Push `head`, a target head the supervisor has checked and recorded, to origin's
+   * pushIntegratedTo branch when origin does not have it yet; this also catches up on pushes that
+   * failed earlier or were cut short by a crash. prepare() and integrate() never push: a head a
+   * worker moved into the clone must not reach the source before the supervisor's check.
+   * `catchUp` (after a sync): only after a successful fetch, and only as a fast-forward.
+   * Never throws. Returns a note: '' when there was nothing to push.
    */
-  protected async pushIntegratedWork(onlyFastForward: boolean): Promise<string> {
+  async pushIntegrated(head: string, catchUp = false): Promise<string> {
     const dest = this.pushIntegratedTo;
-    if (!dest) return '';
+    if (!dest || (catchUp && this.lastFetchError !== null)) return '';
     try {
-      const head = await revParse(this.repoPath, this.targetRef);
-      if (!head) return '';
+      if (!/^[0-9a-f]{40,64}$/.test(head)) throw new Error(`invalid head ${JSON.stringify(head)}`);
       const there = await revParse(this.repoPath, `refs/remotes/origin/${dest}`);
       if (there === head) return '';
       if (there === null) {
         // Not created yet: only worth creating once we have work that origin's target lacks.
         const originTarget = await revParse(this.repoPath, this.remoteTargetRef);
         if (originTarget && (await isAncestor(this.repoPath, head, originTarget))) return '';
-      } else if (onlyFastForward && !(await isAncestor(this.repoPath, there, head))) {
-        return ''; // it has diverged: a plain push would be refused (integrate() reports that)
+      } else if (catchUp && !(await isAncestor(this.repoPath, there, head))) {
+        return ''; // it has diverged: a plain push would be refused (the push after a merge reports that)
       }
       const r = await this.run(['push', '--quiet', 'origin', `${head}:refs/heads/${dest}`], this.repoPath, {
         allowFail: true,
@@ -472,21 +552,21 @@ export class LocalForge implements Forge {
 
   // ------------------------------------------------------- integrate
 
-  async integrate(task: Task, expectedHead: string, runChecks: RunChecks): Promise<IntegrationResult> {
+  /** Merges never push: the supervisor checks the result first, then calls pushIntegrated(). */
+  async integrate(task: Task, expectedHead: string, runChecks: RunChecks, beforeMove?: (commit: string, base: string) => void): Promise<IntegrationResult> {
     try {
       const gate = await this.checkBranchHead(task, expectedHead);
       if ('result' in gate) return gate.result;
       await this.assertSafeRepoConfig();
       const already = await this.findIntegrated(task.id, gate.head);
-      if (already) return await this.withPush({ status: 'merged', mergedCommit: already, checks: [], details: 'already integrated' });
+      if (already) return { status: 'merged', mergedCommit: already, checks: [], details: 'already integrated', foundOnTarget: true };
 
       const sim = await this.simulateMerge(task, gate.head, runChecks);
       if (sim.status === 'failed') return sim.result;
-      if (sim.status === 'no_changes') {
-        return await this.withPush({ status: 'merged', mergedCommit: sim.targetHead, checks: [], details: 'no changes' });
-      }
+      if (sim.status === 'no_changes') return { status: 'merged', mergedCommit: sim.targetHead, checks: [], details: 'no changes', foundOnTarget: true };
 
       // Compare-and-swap: move the target only from the commit the merge was built on.
+      beforeMove?.(sim.commit, sim.targetHead); // crash recovery keeps exactly this commit
       const moved = await this.run(['update-ref', this.targetRef, sim.commit, sim.targetHead], this.repoPath, { allowFail: true });
       if (moved.code !== 0) {
         if ((await revParse(this.repoPath, this.targetRef)) !== sim.targetHead) {
@@ -496,16 +576,10 @@ export class LocalForge implements Forge {
         return errorResult(`could not move ${this.targetBranch} to ${short(sim.commit)}: ${moved.stderr.trim() || `exit ${moved.code}`}`);
       }
       const details = `integrated ${task.id} (${short(gate.head)}) into ${this.targetBranch} as ${short(sim.commit)}`;
-      return await this.withPush({ status: 'merged', mergedCommit: sim.commit, checks: sim.checks, details });
+      return { status: 'merged', mergedCommit: sim.commit, checks: sim.checks, details, movedTarget: true };
     } catch (err) {
       return errorResult(err);
     }
-  }
-
-  /** Push integrated work to pushIntegratedTo (if configured) and note what happened in details. */
-  private async withPush(result: IntegrationResult): Promise<IntegrationResult> {
-    const note = await this.pushIntegratedWork(false);
-    return note ? { ...result, details: `${result.details}; ${note}` } : result;
   }
 
   /** The task branch must still point at expectedHead. Returns the full sha, or a final result. */
@@ -694,7 +768,11 @@ function subjectNamesTask(subject: string, taskId: string): boolean {
 export interface RepoConfigAudit {
   /** Keys that make git run programs or reach other servers; the forge refuses to work with them. */
   unsafe: string[];
-  /** remote.origin.url is missing, repeated or not the configured source: reset it. */
+  /**
+   * remote.origin.url is missing, repeated or not exactly the configured source: reset it. Only
+   * the exact string counts: git reads a relative path against the repository, not against the
+   * supervisor's directory, and follows symlinks in "..".
+   */
   resetUrl: boolean;
   /** remote.origin.fetch is not exactly our refspec: reset it. */
   resetFetch: boolean;
@@ -725,7 +803,7 @@ export function auditRepoConfig(entries: [string, string][], expected: { url: st
   const fetches = entries.filter(([key]) => key === 'remote.origin.fetch').map(([, value]) => value);
   return {
     unsafe,
-    resetUrl: urls.length !== 1 || !sameSource(urls[0], expected.url),
+    resetUrl: urls.length !== 1 || urls[0] !== expected.url,
     resetFetch: fetches.length !== 1 || fetches[0] !== expected.fetch,
   };
 }
@@ -782,12 +860,6 @@ function assertCheckout(path: string): void {
 function isUrlLike(source: string): boolean {
   // scheme://… or scp-like user@host:path (a colon before the first slash).
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(source) || /^[^\/]+:/.test(source);
-}
-
-/** Same repository location: URLs compare exactly, local paths after normalization. */
-function sameSource(a: string, b: string): boolean {
-  if (isUrlLike(a) || isUrlLike(b)) return a === b;
-  return resolve(a) === resolve(b);
 }
 
 /** Reason in a worktree's `locked` file, or null when it is not locked. */

@@ -6,7 +6,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { approve, builderResult, commitFile, harness, type Harness } from './harness.ts';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { approve, builderResult, commitFile, git, harness, type Harness } from './harness.ts';
+import { LocalForge } from '../../src/git/local-forge.ts';
 import { sha256Hex } from '../../src/util.ts';
 import type { RunSpec } from '../../src/types.ts';
 
@@ -377,6 +381,139 @@ test('a builder that moves the target branch is caught, the branch restored and 
     assert.match(log, /Autopilot-Task: T-1/, 'it arrived through a reviewed, recorded merge');
   } finally {
     await h.cleanup();
+  }
+});
+
+test('a forged "own merge" for a queued task is caught like any other move of the target branch', T, async () => {
+  let h!: Harness;
+  let forged = '';
+  let queuedId = '';
+  let attackerDeny: string[] = [];
+  const integrating = join(mkdtempSync(join(tmpdir(), 'ap-integrating-')), 'marker');
+  h = await harness({
+    config: (c) => {
+      c.execution.maxBuilders = 3;
+      // Slow integration checks: one task merges while another waits in merge_ready.
+      const slow = "if (process.cwd().includes('_integration')) { require('fs').writeFileSync(process.argv[1], ''); setTimeout(() => {}, 3000); }";
+      c.checks.commands = [{ name: 'slow-integration', run: [process.execPath, '-e', slow, integrating], timeoutSeconds: 60 }];
+    },
+    behavior: (spec) => async (ctl) => {
+      if (spec.role === 'reviewer') return { status: 'succeeded', structuredOutput: approve };
+      await commitFile(ctl, `work/${id(spec)}.txt`, `${id(spec)}\n`, `work ${id(spec)}`);
+      if (!spec.prompt.includes('Attacker')) return { status: 'succeeded', structuredOutput: builderResult('completed') };
+      attackerDeny = spec.disallowedTools;
+      // Strike while one merge runs its integration checks and another task is queued behind it.
+      const tasks = () => h.store.listTasks({ projectId: 'drill' });
+      while (!existsSync(integrating) || !tasks().some((t) => t.state === 'merge_ready')) await ctl.sleep(20);
+      // A perfect copy of the supervisor's own merge commit for the queued task, with extra content.
+      const queued = tasks().find((t) => t.state === 'merge_ready')!;
+      queuedId = queued.id;
+      const main = (await ctl.git(['rev-parse', 'refs/heads/main'])).trim();
+      ctl.writeFile('evil.txt', 'unreviewed\n');
+      await ctl.git(['add', 'evil.txt']);
+      const tree = (await ctl.git(['write-tree'])).trim();
+      const message = `${queued.title} (${queued.id})\n\nAutopilot-Task: ${queued.id}\nAutopilot-Head: ${queued.headCommit}\n`;
+      forged = (await ctl.git(['-c', 'user.name=StayOn Autopilot', '-c', 'user.email=autopilot@localhost', 'commit-tree', tree, '-p', main, '-m', message])).trim();
+      await ctl.git(['fetch', '-q', '.', `${forged}:refs/heads/main`]);
+      await ctl.git(['rm', '-q', '-f', 'evil.txt']);
+      return { status: 'succeeded', structuredOutput: builderResult('completed') };
+    },
+  });
+  try {
+    h.addTask('Alpha');
+    h.addTask('Beta');
+    h.addTask('Attacker');
+    await h.sup.start();
+    await h.waitFor(() => h.store.listEvents({ types: ['security.target_moved'] }).length > 0, 'tamper detected');
+    // Usually the forged commit itself is found; had a merge already started on top of it, that merge is.
+    const { actual } = h.store.listEvents({ types: ['security.target_moved'] })[0].data as { actual: string };
+    assert.ok(actual === forged || git(h.bare, 'rev-parse', `${actual}^1`) === forged, 'the forged commit was caught');
+    assert.equal(h.store.getProject('drill')!.paused, true, 'project paused');
+    assert.notEqual(git(h.bare, 'rev-parse', 'main'), actual, 'main restored');
+    assert.equal(h.readTarget('evil.txt'), null);
+    const card = h.store.listDecisions({ status: ['pending'] }).find((d) => d.dedupeKey?.startsWith('target-moved:'));
+    assert.equal(card?.priority, 'urgent');
+    assert.notEqual(h.store.getTask(queuedId)!.state, 'integrated', 'the forged commit did not pass for the queued merge');
+    // Defense in depth: builders are also denied the commands that forge commits or move refs.
+    for (const rule of ['Bash(git commit-tree:*)', 'Bash(git replace:*)', 'Bash(git branch -M:*)', 'Bash(git branch --force:*)']) {
+      assert.ok(attackerDeny.includes(rule), rule);
+    }
+  } finally {
+    await h.cleanup();
+    rmSync(dirname(integrating), { recursive: true, force: true });
+  }
+});
+
+/**
+ * What a supervisor that died in the middle of a merge leaves behind: the target head it recorded,
+ * one task merging (leased by the dead process) and one queued in merge_ready, both checked and
+ * approved on their heads.
+ */
+async function crashedWhileMerging(h: Harness) {
+  const forge = new LocalForge({ source: h.src, home: dirname(h.bare), targetBranch: 'main', branchPrefix: h.cfg.repo.branchPrefix, strategy: 'squash', pushIntegratedTo: null });
+  await forge.prepare();
+  const target = await forge.targetHead();
+  h.store.setKv('target_head:drill', target);
+  const queue = async (title: string) => {
+    const t = h.addTask(title);
+    const wt = await forge.createWorktree(t.id, title);
+    writeFileSync(join(wt.path, `${t.id}.txt`), `${t.id}\n`);
+    git(wt.path, 'add', '-A');
+    git(wt.path, 'commit', '-q', '-m', `work ${t.id}`);
+    const head = git(wt.path, 'rev-parse', 'HEAD');
+    h.store.patchTask(t.id, { branch: wt.branch, worktree: wt.path, baseCommit: target, headCommit: head });
+    h.store.recordChecks(t.id, head, 'branch', [{ name: 'no-broken-marker', command: ['node'], status: 'passed', durationMs: 1, outputTail: '' }]);
+    h.store.recordReview({ taskId: t.id, runId: null, headCommit: head, verdict: 'approve', risk: 'low', summary: 'ok', findings: [] });
+    const checked = h.store.claim(t.id, ['ready'], 'checking', 'sup-dead:checks', 60_000)!;
+    return h.store.release(t.id, 'sup-dead:checks', checked.generation, 'merge_ready', 'checked and reviewed')!;
+  };
+  const interrupted = await queue('Interrupted');
+  const queued = await queue('Queued');
+  h.store.claim(interrupted.id, ['merge_ready'], 'merging', 'sup-dead:merge', 60_000);
+  return { forge, target, interrupted: h.store.getTask(interrupted.id)!, queued };
+}
+
+/** No model runs: these drills only exercise restart recovery and merging. */
+const noRuns = () => async () => {
+  throw new Error('no model run expected');
+};
+
+test('a merge that a crash cut off before it was recorded is kept after the restart', T, async () => {
+  const h = await harness({ behavior: noRuns });
+  try {
+    const { forge, interrupted, queued } = await crashedWhileMerging(h);
+    const merged = await forge.integrate(interrupted, interrupted.headCommit!, async () => [], (commit, base) => h.store.setKv('merge_pending:drill', JSON.stringify({ taskId: interrupted.id, base, commit }))); // ... then the process died
+    assert.equal(merged.status, 'merged', merged.details);
+    await h.sup.start();
+    await h.waitState(interrupted.id, 'integrated');
+    await h.waitState(queued.id, 'integrated');
+    assert.equal(h.store.listEvents({ types: ['security.target_moved'] }).length, 0);
+    assert.equal(h.store.getProject('drill')!.paused, false);
+    assert.equal(git(h.bare, 'rev-parse', 'main~1'), merged.mergedCommit, 'kept, not merged a second time');
+    assert.equal(h.store.listRuns({}).length, 0);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('after a restart, an unrecorded commit that is not the interrupted merge is tampering', T, async () => {
+  for (const variant of ['for the queued task', 'for the interrupted task at another head']) {
+    const h = await harness({ behavior: noRuns });
+    try {
+      const { target, interrupted, queued } = await crashedWhileMerging(h);
+      // While the supervisor was down, main was moved to a commit dressed up as one of its merges.
+      const named = variant === 'for the queued task' ? queued : interrupted;
+      const message = `${named.title} (${named.id})\n\nAutopilot-Task: ${named.id}\nAutopilot-Head: ${queued.headCommit}\n`;
+      const forged = git(h.bare, 'commit-tree', `${queued.headCommit}^{tree}`, '-p', target, '-m', message);
+      git(h.bare, 'update-ref', 'refs/heads/main', forged);
+      await h.sup.start();
+      await h.waitFor(() => h.store.listEvents({ types: ['security.target_moved'] }).length === 1, `tamper detected (${variant})`);
+      assert.equal(h.store.getProject('drill')!.paused, true, variant);
+      assert.equal(git(h.bare, 'rev-parse', 'main'), target, `main restored (${variant})`);
+      assert.equal(h.store.listTasks({ states: ['integrated'] }).length, 0, variant);
+    } finally {
+      await h.cleanup();
+    }
   }
 });
 
