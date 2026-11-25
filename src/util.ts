@@ -131,7 +131,8 @@ export const NEVER_AUTO_COMMIT = /(^|\/)(\.env(?!\.example|\.sample|\.template)[
 
 /**
  * Environment for commands the supervisor runs over builder-controlled files
- * (git in worktrees, checks): no Claude/GitHub/cloud credentials, no git prompts,
+ * (git in worktrees, checks): no Claude/GitHub/cloud credentials, no git prompts, no
+ * variables that point git at another repository (git sets some of them for hooks),
  * and git ignores replace refs and grafts (refs/replace/*, info/grafts, which workers
  * can write), as with FORCED_GIT_ENV in git/git.ts.
  */
@@ -139,7 +140,9 @@ export function scrubbedEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(base)) {
     if (/^(ANTHROPIC_|CLAUDE_CODE_|CLAUDE_AGENT_SDK_|AWS_|GOOGLE_APPLICATION_CREDENTIALS|AZURE_)/.test(k)) continue;
-    if (['CLAUDECODE', 'CLAUDE_PID', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'NPM_TOKEN', 'NODE_AUTH_TOKEN', 'SSH_AUTH_SOCK'].includes(k)) continue;
+    if (['CLAUDECODE', 'CLAUDE_PID', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'NPM_TOKEN', 'NODE_AUTH_TOKEN', 'SSH_AUTH_SOCK'].includes(k)) continue;
+    // The same list as REPO_REDIRECT_VARS in git/git.ts (which imports this file).
+    if (['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_PREFIX'].includes(k)) continue;
     env[k] = v;
   }
   env.GIT_TERMINAL_PROMPT = '0';

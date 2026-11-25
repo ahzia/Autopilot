@@ -966,3 +966,56 @@ test('the upstream query sees the owner\'s hasconfig:remote.*.url includes, as t
   assert.equal(await forge.targetHead(), b);
   assert.equal(forge.upstreamHead(), b);
 });
+
+test("the supervisor's own git environment drops repository redirects and GitHub tokens", () => {
+  const redirects = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_PREFIX'];
+  const tokens = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'];
+  const env = scrubbedEnv({ PATH: '/usr/bin', GIT_AUTHOR_NAME: 'kept', ...Object.fromEntries([...redirects, ...tokens].map((key) => [key, `/x/${key}`])) });
+  for (const key of [...redirects, ...tokens]) assert.equal(env[key], undefined, key);
+  assert.equal(env.PATH, '/usr/bin');
+  assert.equal(env.GIT_AUTHOR_NAME, 'kept');
+});
+
+test("autopilot init --create makes its repository where asked, even with a git hook's GIT_DIR inherited", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-init-gitdir-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const decoy = path.join(dir, 'decoy.git');
+  await git(['init', '-q', '--bare', decoy], { cwd: dir });
+  const source = path.join(dir, 'new');
+  const cli = path.resolve(import.meta.dirname, '..', 'bin', 'autopilot.ts');
+  const args = [cli, 'init', 'demo', '--home', path.join(dir, 'home'), '--source', source, '--create', '--runner', 'fake'];
+  const r = await runCommand(process.execPath, args, { cwd: dir, env: { ...process.env, GIT_DIR: decoy } });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal((await git(['log', '--format=%s'], { cwd: source })).stdout.trim(), 'Initial commit');
+  assert.equal((await git(['rev-list', '--all'], { cwd: decoy, allowFail: true })).stdout.trim(), '', 'nothing was written to the other repository');
+});
+
+test("autopilot doctor asks the source itself, not a repository that a git hook's GIT_DIR names", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-doctor-gitdir-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // A real repository with a main branch, and a source address where nothing exists.
+  const real = path.join(dir, 'real');
+  fs.mkdirSync(real);
+  await git(['init', '-q', '-b', 'main'], { cwd: real });
+  await git([...AUTHOR, 'commit', '-q', '--allow-empty', '-m', 'A'], { cwd: real });
+  const missing = 'file:///nonexistent-autopilot-doctor/repo.git';
+  // The repository that GIT_DIR names maps the missing source to the real one.
+  const decoy = path.join(dir, 'decoy');
+  fs.mkdirSync(decoy);
+  await git(['init', '-q'], { cwd: decoy });
+  await git(['config', `url.file://${real}.insteadOf`, missing], { cwd: decoy });
+  const cli = path.resolve(import.meta.dirname, '..', 'bin', 'autopilot.ts');
+  const home = path.join(dir, 'home');
+  const init = await runCommand(process.execPath, [cli, 'init', 'demo', '--home', home, '--source', missing, '--runner', 'fake'], { cwd: dir });
+  assert.equal(init.code, 0, init.stderr);
+  // Only git on the PATH, so doctor's other checks have nothing to run.
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin);
+  const gitBin = (process.env.PATH ?? '').split(path.delimiter).map((d) => path.join(d, 'git')).find((p) => fs.existsSync(p));
+  assert.ok(gitBin, 'git is on the PATH');
+  fs.symlinkSync(gitBin, path.join(bin, 'git'));
+  const doctor = await runCommand(process.execPath, [cli, 'doctor', '--home', home], { cwd: dir, env: { ...process.env, PATH: bin, GIT_DIR: path.join(decoy, '.git') } });
+  assert.equal(doctor.code, 0, doctor.stderr);
+  const line = doctor.stdout.split('\n').find((l) => l.includes('project demo')) ?? '';
+  assert.match(line, /cannot see branch main in file:\/\/\/nonexistent-autopilot-doctor\/repo\.git/);
+});

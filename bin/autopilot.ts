@@ -8,6 +8,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ConfigError, defaultConfig, loadConfigFile, validateConfig, type ProjectConfig } from '../src/config.ts';
+import { gitEnv } from '../src/git/git.ts';
 import { resolveHome, readServerSettings, type Home } from '../src/home.ts';
 import { Store } from '../src/store.ts';
 import type { Decision, SupervisorActions, TaskState } from '../src/types.ts';
@@ -149,7 +150,7 @@ async function cmdInit(home: Home, args: string[]): Promise<void> {
     if (/^[a-z]+:\/\//.test(source) || source.startsWith('git@')) fail('--create only works with a local path');
     if (existsSync(join(source, '.git'))) fail(`${source} is already a git repository (drop --create)`);
     mkdirSync(source, { recursive: true });
-    const g = (...a: string[]) => execFileSync('git', a, { cwd: source, stdio: 'ignore' });
+    const g = (...a: string[]) => execFileSync('git', a, { cwd: source, stdio: 'ignore', env: gitEnv() }); // no GIT_DIR & co. from a calling hook
     g('init', '-q', '-b', values.target ?? 'main');
     writeFileSync(join(source, 'README.md'), `# ${values.name ?? id}\n\nBuilt with StayOn Autopilot.\n`);
     writeFileSync(join(source, '.gitignore'), 'node_modules/\n.env*\n!.env.example\ndist/\n.expo/\ncoverage/\n');
@@ -247,7 +248,8 @@ async function cmdDoctor(home: Home): Promise<void> {
   }
   for (const e of errors) check(`project ${e.id}`, false, `invalid config: ${e.message}`);
   for (const c of configs) {
-    const ls = spawnSync('git', ['ls-remote', '--heads', c.repo.source, c.repo.targetBranch], { encoding: 'utf8', env: { ...env, GIT_TERMINAL_PROMPT: '0' }, timeout: 20_000 });
+    // gitEnv(): no GIT_DIR & co. from a calling hook, whose config could answer for the source.
+    const ls = spawnSync('git', ['ls-remote', '--heads', c.repo.source, c.repo.targetBranch], { encoding: 'utf8', env: gitEnv(), timeout: 20_000 });
     const ok = ls.status === 0 && ls.stdout.includes(`refs/heads/${c.repo.targetBranch}`);
     check(`project ${c.id}`, ok, ok ? `${c.profile}, ${c.repo.forge}, ${c.checks.commands.length} check(s), ${c.docs.length} doc(s)` : `cannot see branch ${c.repo.targetBranch} in ${c.repo.source}`);
     for (const d of c.docs) if (!existsSync(d)) check(`  doc`, false, `missing ${d}`);
