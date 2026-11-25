@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { approve, builderResult, commitFile, git, harness, type Harness } from './harness.ts';
@@ -1927,5 +1927,131 @@ test('a head stored by a failed sync is forgotten even when a worker puts main o
   } finally {
     rmSync(lock, { force: true });
     await h.cleanup();
+  }
+});
+
+test('a target moved while a merge measures the branch never hides commits from the secret scan or the merge policy', T, async () => {
+  const key = ['AKIA', 'Q7Z2LM4N8P3R5T6V'].join(''); // assembled here, so this file holds no key-shaped text
+  let first = '';
+  let recorded = '';
+  let moveBack = false;
+  const h = await harness({
+    behavior: noRuns,
+    config: (c) => void (c.repo.pushIntegratedTo = 'autopilot/main'),
+    forge: (local) => {
+      const diff = local.diff.bind(local);
+      local.diff = async (base, head, max) => {
+        if (moveBack) {
+          moveBack = false;
+          git(local.repoPath, 'update-ref', 'refs/heads/main', recorded); // ... and back before the merge's own check
+        }
+        return diff(base, head, max);
+      };
+      return local;
+    },
+  });
+  try {
+    const setup = new LocalForge({ source: h.src, home: dirname(h.bare), targetBranch: 'main', branchPrefix: h.cfg.repo.branchPrefix, strategy: h.cfg.integration.strategy, pushIntegratedTo: null });
+    await setup.prepare();
+    recorded = await setup.targetHead();
+    h.store.setKv('target_head:drill', recorded);
+    // A branch whose first commit adds a key and whose second adds a feature, checked and approved.
+    const t = h.addTask('Feature');
+    const wt = await setup.createWorktree(t.id, 'feature');
+    writeFileSync(join(wt.path, 'creds.txt'), `aws_access_key_id = ${key}\n`);
+    git(wt.path, 'add', '-A');
+    git(wt.path, 'commit', '-q', '-m', 'config');
+    first = git(wt.path, 'rev-parse', 'HEAD');
+    writeFileSync(join(wt.path, 'feature.txt'), 'feature\n');
+    git(wt.path, 'add', '-A');
+    git(wt.path, 'commit', '-q', '-m', 'feature');
+    const head = git(wt.path, 'rev-parse', 'HEAD');
+    h.store.patchTask(t.id, { branch: wt.branch, worktree: wt.path, baseCommit: recorded, headCommit: head });
+    h.store.recordChecks(t.id, head, 'branch', [{ name: 'no-broken-marker', command: ['node'], status: 'passed', durationMs: 1, outputTail: '' }]);
+    h.store.recordReview({ taskId: t.id, runId: null, headCommit: head, verdict: 'approve', risk: 'low', summary: 'ok', findings: [] });
+    const checked = h.store.claim(t.id, ['ready'], 'checking', 'x:checks', 60_000)!;
+    h.store.release(t.id, 'x:checks', checked.generation, 'merge_ready', 'checked and reviewed');
+    // Right after the tick's target check, as the merge job claims the task, a worker moves main
+    // onto the branch's first commit, so that main and the branch meet there ...
+    const claim = h.store.claim.bind(h.store);
+    h.store.claim = (id, from, to, owner, ttl) => {
+      const r = claim(id, from, to, owner, ttl);
+      if (r && to === 'merging' && !moveBack) {
+        git(h.bare, 'update-ref', 'refs/heads/main', first);
+        moveBack = true;
+      }
+      return r;
+    };
+    await h.sup.start();
+    // The note stays; the state moves on once a repair run starts (none may run here).
+    const sentBack = () => h.store.getTask(t.id)!.notes.some((n) => n.text.includes('AWS access key in creds.txt'));
+    await h.waitFor(() => sentBack() || h.store.getTask(t.id)!.state === 'integrated', 'the merge decided');
+    assert.notEqual(h.store.getTask(t.id)!.state, 'integrated');
+    assert.ok(sentBack(), 'sent back for the key in its first commit');
+    assert.equal(h.readTarget('creds.txt'), null);
+    assert.equal(git(h.bare, 'rev-parse', 'refs/heads/main'), recorded);
+    assert.equal(sourceHas(h, first), false, 'nothing with the key was pushed');
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test('on GitHub, a branch that took in the head a running merge job synced is measured from that head', T, async () => {
+  const key = ['AKIA', 'Q7Z2LM4N8P3R5T6V'].join(''); // assembled here, so this file holds no key-shaped text
+  const dir = mkdtempSync(join(tmpdir(), 'ap-drill-hold-'));
+  const hold = join(dir, 'hold');
+  const integrating = join(dir, 'integrating');
+  writeFileSync(hold, '');
+  // The first integration check waits while `hold` exists, so that merge job stays open.
+  const held = `const fs=require('fs');const [hold,integ]=process.argv.slice(1);if(process.cwd().includes('_integration')&&!fs.existsSync(integ)){fs.writeFileSync(integ,'');const t=setInterval(()=>{if(!fs.existsSync(hold))clearInterval(t)},50)}`;
+  let upstream = '';
+  let repairer = '';
+  let tookIn = false;
+  let h!: Harness;
+  h = await harness({
+    config: (c) => {
+      c.execution.maxBuilders = 2;
+      c.checks.commands = [{ name: 'held', run: [process.execPath, '-e', held, hold, integrating], timeoutSeconds: 120 }];
+    },
+    forge: (local) => new GitHubOnSource({ source: local.source, home: local.home, targetBranch: 'main', branchPrefix: 'autopilot/', strategy: 'squash', repo: 'o/r', confirmDelayMs: 0 }),
+    behavior: (spec) => async (ctl) => {
+      if (spec.role === 'reviewer') return { status: 'succeeded', structuredOutput: approve };
+      if (spec.prompt.includes('Repairer') && !tookIn) {
+        repairer = id(spec);
+        // Conflict repair while the other task's merge job runs: take in the main that job synced.
+        while (!existsSync(integrating)) await ctl.sleep(20);
+        await ctl.git(['-c', 'user.name=B', '-c', 'user.email=b@example.invalid', 'merge', '-q', '--no-edit', 'main']);
+        tookIn = true;
+      }
+      await commitFile(ctl, `work/${id(spec)}.txt`, `${id(spec)}\n`, `work ${id(spec)}`);
+      if (spec.prompt.includes('First') && !upstream) {
+        // After the first sync, the founder pushes a fixture holding a key-shaped string. The merge
+        // job's own sync takes it in; the supervisor records it only when that job ends.
+        const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: h.src, input: `aws_access_key_id = ${key}\n`, encoding: 'utf8' }).trim();
+        const listing = execFileSync('git', ['ls-tree', 'refs/heads/main'], { cwd: h.src, encoding: 'utf8' });
+        const tree = execFileSync('git', ['mktree'], { cwd: h.src, input: `${listing}100644 blob ${blob}\tscanner-fixture.txt\n`, encoding: 'utf8' }).trim();
+        upstream = git(h.src, 'commit-tree', tree, '-p', 'refs/heads/main', '-m', 'Add a fixture for the scanner tests');
+        git(h.src, 'update-ref', 'refs/heads/main', upstream);
+      }
+      return { status: 'succeeded', structuredOutput: builderResult('completed') };
+    },
+  });
+  try {
+    h.addTask('First');
+    h.addTask('Repairer');
+    await h.sup.start();
+    const secretNote = () => h.store.getTask(repairer)!.notes.some((n) => n.text.includes('Secret-looking content'));
+    await h.waitFor(() => tookIn && (h.store.getTask(repairer)!.state === 'merge_ready' || secretNote()), 'the repairer published and reviewed');
+    assert.equal(git(h.bare, 'merge-base', '--is-ancestor', upstream, h.store.getTask(repairer)!.headCommit!), '', 'the branch took in the synced head');
+    assert.notEqual(h.store.getKv('target_head:drill'), upstream, 'while the merge job still runs');
+    assert.equal(secretNote(), false, "the founder's fixture is not taken for the branch's secret");
+    assert.deepEqual((await h.sup.taskDiff(repairer))!.files.map((f) => f.path), [`work/${repairer}.txt`]);
+    rmSync(hold, { force: true });
+    await h.waitFor(() => h.store.listTasks({}).every((t) => t.state === 'integrated'), 'both integrated');
+    assert.equal(tamperEvents(h).length, 0);
+  } finally {
+    rmSync(hold, { force: true });
+    await h.cleanup();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

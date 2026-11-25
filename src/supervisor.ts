@@ -1399,11 +1399,22 @@ export class Supervisor implements SupervisorActions {
   /**
    * The base to diff a task against: where its branch meets the current target. After a
    * builder merges the target into its branch (conflict repair), this excludes other
-   * tasks' changes, so review and policy judge only this task's work.
+   * tasks' changes, so review and policy judge only this task's work. The target is the head
+   * the supervisor recorded (or the newer head the source confirmed, while a sync's move awaits
+   * its record), not refs/heads/<target>: a worker can move that ref at any moment, for example
+   * onto the branch's own first commit while a merge reads it, and the secret scan and the merge
+   * policy would then miss commits that the merge onto the recorded head brings in.
    */
   private async diffBase(rt: ProjectRuntime, t: Task, head: string): Promise<string> {
     if (rt.barePath) {
-      const mb = await safeGit(['merge-base', `refs/heads/${rt.cfg.repo.targetBranch}`, head], { cwd: rt.barePath, allowFail: true });
+      const recorded = this.store.getKv(`target_head:${rt.cfg.id}`);
+      let target = recorded ?? `refs/heads/${rt.cfg.repo.targetBranch}`;
+      // A sync may have moved the target to the source's confirmed head before it is recorded (a
+      // GitHub merge job records it only when it ends); a branch that took that head in is
+      // measured from it, never from a head a worker moved in.
+      const actual = recorded ? await rt.forge.targetHead().catch(() => null) : null;
+      if (recorded && actual && actual !== recorded && (await this.isUpstreamAdvance(rt, recorded, actual))) target = actual;
+      const mb = await safeGit(['merge-base', target, head], { cwd: rt.barePath, allowFail: true });
       const sha = mb.stdout.trim();
       if (mb.code === 0 && /^[0-9a-f]{40}$/.test(sha)) return sha;
     }
